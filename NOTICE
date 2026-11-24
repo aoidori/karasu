@@ -1,0 +1,10 @@
+Karasu
+Copyright 2026 Karasu Contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+Conceptual design attribution:
+The sliding-window consumer lag evaluation model (OK / WARN / ERR / STOP / STALL / REWIND)
+and __consumer_offsets ingestion approach are inspired by LinkedIn Burrow
+(https://github.com/linkedin/Burrow), licensed under the Apache License, Version 2.0.
+Karasu is an independent clean-room Java 17 implementation.

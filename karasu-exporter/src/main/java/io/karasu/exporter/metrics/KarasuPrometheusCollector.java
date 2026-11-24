@@ -1,0 +1,322 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ */
+package io.karasu.exporter.metrics;
+
+import io.karasu.core.collector.ClusterManager;
+import io.karasu.core.snapshot.ClusterMetricsSnapshot;
+import io.karasu.core.snapshot.ClusterMetricsSnapshot.DecodeErrorKey;
+import io.karasu.exporter.labels.LabelNormalizer;
+import io.karasu.protocol.model.ClusterHealthSnapshot;
+import io.karasu.protocol.model.ClusterPhase;
+import io.karasu.protocol.model.ClusterTargetKey;
+import io.karasu.protocol.model.GroupEvaluation;
+import io.karasu.protocol.model.PartitionEvaluation;
+import io.prometheus.metrics.model.registry.MultiCollector;
+import io.prometheus.metrics.model.snapshots.CounterSnapshot;
+import io.prometheus.metrics.model.snapshots.CounterSnapshot.CounterDataPointSnapshot;
+import io.prometheus.metrics.model.snapshots.GaugeSnapshot;
+import io.prometheus.metrics.model.snapshots.GaugeSnapshot.GaugeDataPointSnapshot;
+import io.prometheus.metrics.model.snapshots.Labels;
+import io.prometheus.metrics.model.snapshots.MetricSnapshots;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Lock-free Prometheus {@link MultiCollector} that streams Karasu's immutable per-cluster snapshots
+ * directly into OpenMetrics / Prometheus text snapshots.
+ *
+ * <p>Because every scrape reads freshly published immutable snapshots rather than mutating global
+ * Gauge registries, expired groups, deleted topics, and hot-removed clusters vanish immediately
+ * without stale-series leaks or scrape-time mutex contention.
+ */
+public final class KarasuPrometheusCollector implements MultiCollector {
+
+    private static final String[] EMPTY = new String[0];
+    private static final String[] STATE_NAME = new String[]{"state"};
+    private static final String[] GROUP_NAME = new String[]{"consumer_group"};
+    private static final String[] PARTITION_NAMES = new String[]{"consumer_group", "topic", "partition"};
+    private static final String[] TOPIC_PART_NAMES = new String[]{"topic", "partition"};
+    private static final String[] DECODE_ERR_NAMES = new String[]{"record_type", "reason"};
+    private static final String[] RECONCILE_ERR_NAMES = new String[]{"phase"};
+    private static final ClusterPhase[] EXPOSED_PHASES = new ClusterPhase[]{
+            ClusterPhase.INITIALIZING,
+            ClusterPhase.WAITING_OFFSETS_TOPIC,
+            ClusterPhase.REPLAYING,
+            ClusterPhase.READY,
+            ClusterPhase.DEGRADED
+    };
+
+    private final ClusterManager clusterManager;
+    private final LabelNormalizer labelNormalizer;
+    private final ExporterOptions options;
+
+    public record ExporterOptions(
+            String metricPrefix,
+            boolean publishStaleOnDegraded,
+            boolean requireCompleteWindowForOffset
+    ) {
+        public ExporterOptions {
+            metricPrefix = (metricPrefix == null || metricPrefix.isBlank()) ? "karasu_kafka" : metricPrefix.trim();
+        }
+    }
+
+    public KarasuPrometheusCollector(ClusterManager clusterManager,
+                                     LabelNormalizer labelNormalizer,
+                                     ExporterOptions options) {
+        this.clusterManager = clusterManager;
+        this.labelNormalizer = labelNormalizer;
+        this.options = options;
+    }
+
+    @Override
+    public MetricSnapshots collect() {
+        return collectSnapshots(clusterManager.currentSnapshots());
+    }
+
+    public MetricSnapshots collectFiltered(String k8sClusterFilter, String kafkaClusterFilter) {
+        List<ClusterMetricsSnapshot> all = clusterManager.currentSnapshots();
+        List<ClusterMetricsSnapshot> filtered = new ArrayList<>(all.size());
+        for (ClusterMetricsSnapshot snap : all) {
+            ClusterTargetKey k = snap.targetKey();
+            if (k8sClusterFilter != null && !k8sClusterFilter.isEmpty() && !k8sClusterFilter.equals(k.k8sCluster())) {
+                continue;
+            }
+            if (kafkaClusterFilter != null && !kafkaClusterFilter.isEmpty() && !kafkaClusterFilter.equals(k.kafkaCluster())) {
+                continue;
+            }
+            filtered.add(snap);
+        }
+        return collectSnapshots(filtered);
+    }
+
+    MetricSnapshots collectSnapshots(List<ClusterMetricsSnapshot> snapshots) {
+        // Resolve cluster-level extra labels and compute unified schema keys
+        List<Map<String, String>> clusterExtras = new ArrayList<>(snapshots.size());
+        List<Map<String, String>> allGroupExtrasObserved = new ArrayList<>();
+        for (ClusterMetricsSnapshot snap : snapshots) {
+            Map<String, String> cExtra = labelNormalizer.resolveClusterExtraLabels(snap.spec());
+            clusterExtras.add(cExtra);
+            allGroupExtrasObserved.add(cExtra);
+            if (shouldPublishBusinessMetrics(snap)) {
+                for (GroupEvaluation g : snap.groups()) {
+                    Map<String, String> gExtra = labelNormalizer.resolveGroupExtraLabels(snap.spec(), cExtra, g.group());
+                    if (gExtra != cExtra) {
+                        allGroupExtrasObserved.add(gExtra);
+                    }
+                }
+            }
+        }
+
+        List<String> unifiedClusterExtraKeys = labelNormalizer.computeUnifiedExtraKeys(clusterExtras);
+        List<String> unifiedGroupExtraKeys = labelNormalizer.computeUnifiedExtraKeys(allGroupExtrasObserved);
+
+        String p = options.metricPrefix();
+
+        // Business metric builders
+        GaugeSnapshot.Builder consumerLagSum = GaugeSnapshot.builder()
+                .name(p + "_consumer_lag_sum")
+                .help("Sum of all partition current lag values for the consumer group.");
+        GaugeSnapshot.Builder consumerStatus = GaugeSnapshot.builder()
+                .name(p + "_consumer_status")
+                .help("Consumer group evaluation status (0=NOTFOUND, 1=OK, 2=WARN, 3=ERR).");
+        GaugeSnapshot.Builder partitionLag = GaugeSnapshot.builder()
+                .name(p + "_consumer_partition_lag")
+                .help("Approximate message lag for a consumer group topic-partition.");
+        GaugeSnapshot.Builder partitionCurrentOffset = GaugeSnapshot.builder()
+                .name(p + "_consumer_current_offset")
+                .help("Latest committed offset stored for this consumer group topic-partition.");
+        GaugeSnapshot.Builder partitionStatus = GaugeSnapshot.builder()
+                .name(p + "_topic_partition_status")
+                .help("Partition evaluation status (1=OK, 2=WARN, 4=STOP, 5=STALL, 6=REWIND).");
+        GaugeSnapshot.Builder topicPartitionOffset = GaugeSnapshot.builder()
+                .name(p + "_topic_partition_offset")
+                .help("Latest sampled broker log-end offset for this topic-partition.");
+
+        // Cluster health & capacity metric builders
+        GaugeSnapshot.Builder clusterUp = GaugeSnapshot.builder()
+                .name("karasu_cluster_up")
+                .help("Per-cluster collection quality gate (1=head fresh, offsets caught up, and reachable; 0=unhealthy/replaying).");
+        GaugeSnapshot.Builder clusterState = GaugeSnapshot.builder()
+                .name("karasu_cluster_state")
+                .help("One-hot indicator of current per-cluster lifecycle phase.");
+        GaugeSnapshot.Builder collectionSuccess = GaugeSnapshot.builder()
+                .name("karasu_cluster_collection_success")
+                .help("Latest broker head-offset cycle succeeded for all known online partitions (1/0).");
+        GaugeSnapshot.Builder collectionLastSuccess = GaugeSnapshot.builder()
+                .name("karasu_cluster_collection_last_success_timestamp_seconds")
+                .help("Unix timestamp in seconds of the last complete broker head-offset cycle.");
+        GaugeSnapshot.Builder offsetsCaughtUp = GaugeSnapshot.builder()
+                .name("karasu_cluster_offsets_caught_up")
+                .help("Internal __consumer_offsets reader completed replay catch-up (1/0).");
+        GaugeSnapshot.Builder offsetsLag = GaugeSnapshot.builder()
+                .name("karasu_cluster_offsets_lag")
+                .help("Remaining unread records across assigned __consumer_offsets partitions.");
+        GaugeSnapshot.Builder trackedGroups = GaugeSnapshot.builder()
+                .name("karasu_cluster_tracked_groups")
+                .help("Number of consumer groups currently tracked in memory for this cluster.");
+        GaugeSnapshot.Builder trackedPartitions = GaugeSnapshot.builder()
+                .name("karasu_cluster_tracked_partitions")
+                .help("Number of (group, topic, partition) windows currently tracked in memory.");
+        GaugeSnapshot.Builder cardinalityLimit = GaugeSnapshot.builder()
+                .name("karasu_cluster_cardinality_limit_reached")
+                .help("Whether this cluster reached its configured memory guardrail limit (1/0).");
+        GaugeSnapshot.Builder snapshotBuildDuration = GaugeSnapshot.builder()
+                .name("karasu_snapshot_build_duration_seconds")
+                .help("Duration in seconds of the latest background metrics snapshot build.");
+        // OpenMetrics/Prometheus 1.x automatically appends "_total" when rendering CounterSnapshot
+        CounterSnapshot.Builder decodeErrors = CounterSnapshot.builder()
+                .name("karasu_cluster_decode_errors")
+                .help("Total __consumer_offsets record decode failures or unknown key versions.");
+        CounterSnapshot.Builder reconcileErrors = CounterSnapshot.builder()
+                .name("karasu_cluster_reconcile_errors")
+                .help("Total cluster hot-reload validation or swap failures.");
+
+        boolean hasBusinessLag = false;
+        boolean hasPartitionOffset = false;
+        boolean hasTopicOffset = false;
+        boolean hasDecodeErrors = false;
+        boolean hasReconcileErrors = false;
+
+        for (int i = 0; i < snapshots.size(); i++) {
+            ClusterMetricsSnapshot snap = snapshots.get(i);
+            ClusterTargetKey target = snap.targetKey();
+            Map<String, String> cExtra = clusterExtras.get(i);
+            ClusterHealthSnapshot h = snap.health();
+
+            Labels baseLabels = labelNormalizer.buildLabels(target, EMPTY, EMPTY, unifiedClusterExtraKeys, cExtra);
+            clusterUp.dataPoint(gaugePoint(baseLabels, h.dataReady() ? 1.0 : 0.0));
+            collectionSuccess.dataPoint(gaugePoint(baseLabels, h.collectionSuccess() ? 1.0 : 0.0));
+            collectionLastSuccess.dataPoint(gaugePoint(baseLabels, (double) h.lastCollectionSuccessEpochSec()));
+            offsetsCaughtUp.dataPoint(gaugePoint(baseLabels, h.offsetsCaughtUp() ? 1.0 : 0.0));
+            offsetsLag.dataPoint(gaugePoint(baseLabels, (double) h.offsetsLagTotal()));
+            trackedGroups.dataPoint(gaugePoint(baseLabels, (double) h.trackedGroups()));
+            trackedPartitions.dataPoint(gaugePoint(baseLabels, (double) h.trackedPartitions()));
+            cardinalityLimit.dataPoint(gaugePoint(baseLabels, h.cardinalityLimitReached() ? 1.0 : 0.0));
+            snapshotBuildDuration.dataPoint(gaugePoint(baseLabels, snap.lastSnapshotBuildDurationSeconds()));
+
+            for (ClusterPhase phase : EXPOSED_PHASES) {
+                Labels stateLabels = labelNormalizer.buildLabels(
+                        target, STATE_NAME, new String[]{phase.name()}, unifiedClusterExtraKeys, cExtra);
+                clusterState.dataPoint(gaugePoint(stateLabels, h.phase() == phase ? 1.0 : 0.0));
+            }
+
+            for (Map.Entry<DecodeErrorKey, Long> err : snap.decodeErrorCounts().entrySet()) {
+                Labels errLabels = labelNormalizer.buildLabels(
+                        target, DECODE_ERR_NAMES,
+                        new String[]{err.getKey().recordType(), err.getKey().reason()},
+                        unifiedClusterExtraKeys, cExtra);
+                decodeErrors.dataPoint(CounterDataPointSnapshot.builder()
+                        .labels(errLabels).value(err.getValue().doubleValue()).build());
+                hasDecodeErrors = true;
+            }
+
+            for (Map.Entry<String, Long> err : snap.reconcileErrorCounts().entrySet()) {
+                Labels errLabels = labelNormalizer.buildLabels(
+                        target, RECONCILE_ERR_NAMES,
+                        new String[]{err.getKey()},
+                        unifiedClusterExtraKeys, cExtra);
+                reconcileErrors.dataPoint(CounterDataPointSnapshot.builder()
+                        .labels(errLabels).value(err.getValue().doubleValue()).build());
+                hasReconcileErrors = true;
+            }
+
+            // Quality gate: suppress stale business lag metrics when cluster is not ready/fresh
+            if (!shouldPublishBusinessMetrics(snap)) {
+                continue;
+            }
+
+            for (GroupEvaluation group : snap.groups()) {
+                Map<String, String> gExtra = labelNormalizer.resolveGroupExtraLabels(snap.spec(), cExtra, group.group());
+                Labels groupLabels = labelNormalizer.buildLabels(
+                        target, GROUP_NAME, new String[]{group.group()}, unifiedGroupExtraKeys, gExtra);
+
+                consumerLagSum.dataPoint(gaugePoint(groupLabels, (double) group.totalLag()));
+                consumerStatus.dataPoint(gaugePoint(groupLabels, (double) group.status().code()));
+                hasBusinessLag = true;
+
+                for (PartitionEvaluation part : group.partitions()) {
+                    Labels partLabels = labelNormalizer.buildLabels(
+                            target,
+                            PARTITION_NAMES,
+                            new String[]{group.group(), part.topic(), Integer.toString(part.partition())},
+                            unifiedGroupExtraKeys,
+                            gExtra);
+                    partitionLag.dataPoint(gaugePoint(partLabels, (double) part.currentLag()));
+
+                    boolean windowReady = !options.requireCompleteWindowForOffset() || part.complete() == 1.0f;
+                    if (windowReady && part.end() != null) {
+                        partitionCurrentOffset.dataPoint(gaugePoint(partLabels, (double) part.end().offset()));
+                        partitionStatus.dataPoint(gaugePoint(partLabels, (double) part.status().code()));
+                        hasPartitionOffset = true;
+                    }
+                }
+            }
+
+            for (Map.Entry<String, long[]> topicEntry : snap.topicPartitionOffsets().entrySet()) {
+                String topic = topicEntry.getKey();
+                long[] offsets = topicEntry.getValue();
+                for (int partIdx = 0; partIdx < offsets.length; partIdx++) {
+                    if (offsets[partIdx] < 0L) {
+                        continue;
+                    }
+                    Labels tpLabels = labelNormalizer.buildLabels(
+                            target,
+                            TOPIC_PART_NAMES,
+                            new String[]{topic, Integer.toString(partIdx)},
+                            unifiedClusterExtraKeys,
+                            cExtra);
+                    topicPartitionOffset.dataPoint(gaugePoint(tpLabels, (double) offsets[partIdx]));
+                    hasTopicOffset = true;
+                }
+            }
+        }
+
+        MetricSnapshots.Builder out = MetricSnapshots.builder();
+        if (!snapshots.isEmpty()) {
+            out.metricSnapshot(clusterUp.build());
+            out.metricSnapshot(clusterState.build());
+            out.metricSnapshot(collectionSuccess.build());
+            out.metricSnapshot(collectionLastSuccess.build());
+            out.metricSnapshot(offsetsCaughtUp.build());
+            out.metricSnapshot(offsetsLag.build());
+            out.metricSnapshot(trackedGroups.build());
+            out.metricSnapshot(trackedPartitions.build());
+            out.metricSnapshot(cardinalityLimit.build());
+            out.metricSnapshot(snapshotBuildDuration.build());
+        }
+        if (hasDecodeErrors) {
+            out.metricSnapshot(decodeErrors.build());
+        }
+        if (hasReconcileErrors) {
+            out.metricSnapshot(reconcileErrors.build());
+        }
+        if (hasBusinessLag) {
+            out.metricSnapshot(consumerLagSum.build());
+            out.metricSnapshot(consumerStatus.build());
+            out.metricSnapshot(partitionLag.build());
+        }
+        if (hasPartitionOffset) {
+            out.metricSnapshot(partitionCurrentOffset.build());
+            out.metricSnapshot(partitionStatus.build());
+        }
+        if (hasTopicOffset) {
+            out.metricSnapshot(topicPartitionOffset.build());
+        }
+        return out.build();
+    }
+
+    private boolean shouldPublishBusinessMetrics(ClusterMetricsSnapshot snap) {
+        if (snap.health().dataReady()) {
+            return true;
+        }
+        return options.publishStaleOnDegraded() && snap.health().phase() == ClusterPhase.DEGRADED;
+    }
+
+    private static GaugeDataPointSnapshot gaugePoint(Labels labels, double value) {
+        return GaugeDataPointSnapshot.builder().labels(labels).value(value).build();
+    }
+}

@@ -1,0 +1,98 @@
+server:
+  port: 8000
+
+spring:
+  application:
+    name: karasu
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # 一期仅开放健康探针；/metrics 由只读控制器直接提供
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+karasu:
+  config:
+    # 是否启用外部配置目录及凭证文件变更监听（自动热增删改集群，兼容 K8s Secret/ConfigMap 挂载）
+    watch-enabled: true
+    watch-interval-seconds: 15
+    # 可选：额外监听的集群 YAML 目录（例如 conf.d/，便于后续多套 Kafka Chart 独立投放配置）
+    additional-cluster-dirs: []
+
+  metrics:
+    # 业务指标前缀
+    prefix: karasu_kafka
+    # 后台构建不可变指标快照的间隔（秒）
+    snapshot-refresh-seconds: 10
+    # 集群断网或数据过期后是否撤下陈旧业务 Lag 指标（false=撤下陈旧值，由 karasu_cluster_up 告警）
+    publish-stale-on-degraded: false
+    # consumer_current_offset 与 topic_partition_status 是否要求窗口完整（true=与 Burrow 一致）
+    require-complete-window-for-offset: true
+    max-extra-labels-per-cluster: 8
+    # L1 全局公共扩展标签（自动附加到本进程产出的所有指标）
+    common-labels: {}
+    # 可选：显式声明扩展标签键集合，保证跨集群 Metric Family Schema 顺序稳定
+    declared-extra-label-keys: []
+
+  defaults:
+    collection:
+      offsets-topic: __consumer_offsets
+      offset-refresh-seconds: 15
+      topic-refresh-seconds: 60
+      # EARLIEST_THEN_LIVE（顺序回放追平后发布业务指标） | LATEST_ONLY
+      start-mode: EARLIEST_THEN_LIVE
+      # READ_COMMITTED（过滤未提交/回滚的 EOS 事务提交） | READ_UNCOMMITTED
+      isolation-level: READ_COMMITTED
+      offsets-consumer-threads: 1
+      # 0 表示关闭定期 Groups Reaper；按需配置如 300 秒
+      groups-reaper-seconds: 0
+      # 连接/凭证变更切换策略：BLUE_GREEN（蓝绿平滑切换） | RECREATE（原地重建）
+      swap-policy: BLUE_GREEN
+      request-timeout-ms: 10000
+      fetch-max-bytes: 4194304
+      max-poll-records: 2000
+    evaluation:
+      intervals: 10
+      min-distance-seconds: 1
+      expire-group-seconds: 604800
+      allowed-lag: 0
+      minimum-complete: 1.0
+      cache-expire-seconds: 10
+    limits:
+      max-groups: 10000
+      max-group-partitions: 200000
+
+  # 支持单进程同时接入多套独立 Kafka 集群/进程，以 (k8s-cluster, kafka-cluster) 作为唯一键
+  clusters: []
+  # 示例：
+  # clusters:
+  #   - k8s-cluster: k8s-cn-east-01
+  #     kafka-cluster: kafka-order-prod
+  #     bootstrap-servers:
+  #       - kafka-order-0.daas.svc:9092
+  #     labels:
+  #       namespace: daas
+  #       tenant: order-team
+  #     auth:
+  #       security-protocol: SASL_PLAINTEXT
+  #       sasl-mechanism: SCRAM-SHA-512
+  #       username: ${KARASU_ORDER_USERNAME:}
+  #       password: ${KARASU_ORDER_PASSWORD:}
+  #       # 或通过挂载文件读取（推荐，支持凭证自动热轮换）：
+  #       # username-file: /etc/karasu/secrets/order/username
+  #       # password-file: /etc/karasu/secrets/order/password
+  #     tls:
+  #       enabled: false
+  #       ca-file: ""
+  #       cert-file: ""
+  #       key-file: ""
+  #     filters:
+  #       group-allowlist: ""
+  #       group-denylist: ""
+  #       export-topic-partition-offset: true
