@@ -26,6 +26,7 @@ final class PartitionCommitRing {
     private int count;
     private String owner = "";
     private String clientId = "";
+    private java.util.UUID topicId;
 
     PartitionCommitRing(int capacity) {
         this.capacity = capacity;
@@ -152,6 +153,14 @@ final class PartitionCommitRing {
     void clearOwner() {
         this.owner = "";
         this.clientId = "";
+    }
+
+    java.util.UUID topicId() {
+        return topicId;
+    }
+
+    void setTopicId(java.util.UUID topicId) {
+        this.topicId = topicId;
     }
 
     CommitSample[] snapshotCommits() {

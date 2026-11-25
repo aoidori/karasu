@@ -24,9 +24,26 @@ public record ClusterMetricsSnapshot(
         Map<String, long[]> topicPartitionOffsets,
         Map<DecodeErrorKey, Long> decodeErrorCounts,
         Map<String, Long> reconcileErrorCounts,
-        double lastSnapshotBuildDurationSeconds,
+        DurationHistogramSnapshot snapshotBuildDurationHistogram,
         long builtAtEpochMs
 ) {
     public record DecodeErrorKey(String recordType, String reason) {
+    }
+
+    /**
+     * Immutable Prometheus classic histogram snapshot (upperBounds + non-cumulative bucket counts + sum).
+     */
+    public record DurationHistogramSnapshot(
+            double[] upperBounds,
+            long[] bucketCounts,
+            double sumSeconds
+    ) {
+        public static final double[] DEFAULT_BUCKETS = new double[]{
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, Double.POSITIVE_INFINITY
+        };
+
+        public static DurationHistogramSnapshot empty() {
+            return new DurationHistogramSnapshot(DEFAULT_BUCKETS, new long[DEFAULT_BUCKETS.length], 0.0);
+        }
     }
 }

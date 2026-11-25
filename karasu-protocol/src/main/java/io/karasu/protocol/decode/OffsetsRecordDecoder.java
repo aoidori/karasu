@@ -5,12 +5,13 @@
 package io.karasu.protocol.decode;
 
 import io.karasu.protocol.decode.DecodedRecord.ClassicGroupMetadataRecord;
+import io.karasu.protocol.decode.DecodedRecord.ClassicGroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.DecodeFailureRecord;
-import io.karasu.protocol.decode.DecodedRecord.GroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.IgnoredInternalRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848AssignmentTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848CurrentAssignmentRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848GroupMetadataRecord;
+import io.karasu.protocol.decode.DecodedRecord.Kip848GroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848MemberMetadataRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848MemberTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.MemberAssignment;
@@ -161,7 +162,7 @@ public final class OffsetsRecordDecoder {
     private DecodedRecord decodeClassicGroupMetadata(short keyType, KafkaByteReader keyReader, byte[] value) throws DecodeException {
         String group = keyReader.readString("group_metadata_key_group");
         if (value == null || value.length == 0) {
-            return new GroupTombstoneRecord(group);
+            return new ClassicGroupTombstoneRecord(group);
         }
 
         KafkaByteReader valReader = new KafkaByteReader(value, maxFieldBytes);
@@ -265,7 +266,7 @@ public final class OffsetsRecordDecoder {
     private DecodedRecord decodeKip848GroupMetadata(KafkaByteReader keyReader, byte[] value) throws DecodeException {
         String groupId = keyReader.readString("kip848_group_id");
         if (value == null || value.length == 0) {
-            return new GroupTombstoneRecord(groupId);
+            return new Kip848GroupTombstoneRecord(groupId);
         }
         return new Kip848GroupMetadataRecord(groupId);
     }

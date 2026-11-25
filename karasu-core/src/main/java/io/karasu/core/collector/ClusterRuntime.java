@@ -7,6 +7,7 @@ package io.karasu.core.collector;
 import io.karasu.core.config.ClusterSpec;
 import io.karasu.core.evaluator.LagEvaluator;
 import io.karasu.core.snapshot.ClusterMetricsSnapshot;
+import io.karasu.core.snapshot.ClusterMetricsSnapshot.DurationHistogramSnapshot;
 import io.karasu.core.storage.ClusterStore;
 import io.karasu.protocol.model.ClusterHealthSnapshot;
 import io.karasu.protocol.model.ClusterPhase;
@@ -16,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,7 +30,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Self-contained, fault-isolated runtime managing collection, storage, evaluation, health gating,
- * and immutable snapshot publishing for a single {@link ClusterTargetKey}.
+ * histogram tracking, and immutable snapshot publishing for a single {@link ClusterTargetKey}.
  */
 public class ClusterRuntime {
 
@@ -50,6 +52,10 @@ public class ClusterRuntime {
     private final AtomicReference<ClusterMetricsSnapshot> latestSnapshot = new AtomicReference<>();
     private final Map<String, AtomicLong> reconcileErrors = new HashMap<>();
 
+    // Cumulative histogram state for karasu_snapshot_build_duration_seconds (#18)
+    private final long[] durationBucketCounts = new long[DurationHistogramSnapshot.DEFAULT_BUCKETS.length];
+    private double durationSumSeconds = 0.0;
+
     private volatile ScheduledFuture<?> offsetTask;
     private volatile ScheduledFuture<?> snapshotTask;
     private volatile ScheduledFuture<?> expiryTask;
@@ -65,9 +71,19 @@ public class ClusterRuntime {
         this.connectionFingerprint = connectionFingerprint;
         this.collectionScheduler = collectionScheduler;
         this.snapshotScheduler = snapshotScheduler;
-        this.store = new ClusterStore(spec);
+
+        AtomicReference<BrokerOffsetCollector> brokerRef = new AtomicReference<>();
+        this.store = new ClusterStore(spec, () -> {
+            BrokerOffsetCollector bc = brokerRef.get();
+            if (bc != null) {
+                bc.requestImmediateMetadataRefresh();
+            }
+        });
         this.evaluator = new LagEvaluator(spec, store);
         this.brokerCollector = new BrokerOffsetCollector(spec, generation, store, evaluator::invalidateAll);
+        this.brokerCollector.attachScheduler(collectionScheduler);
+        brokerRef.set(this.brokerCollector);
+
         this.offsetsIngestor = new OffsetsTopicIngestor(spec, generation, store, brokerCollector, evaluator::invalidateGroup);
         this.latestSnapshot.set(buildSnapshot());
     }
@@ -88,24 +104,24 @@ public class ClusterRuntime {
         return connectionFingerprint;
     }
 
+    public boolean isCardinalityLimitReached() {
+        return store.isCardinalityLimitReached();
+    }
+
     public void start() {
         if (!started.compareAndSet(false, true)) {
             return;
         }
-        // Kick off initial broker offset cycle immediately on shared scheduler, then periodically
         int offsetRefresh = spec.collection().offsetRefreshSeconds();
         this.offsetTask = collectionScheduler.scheduleWithFixedDelay(
                 brokerCollector::collectOnce, 0L, offsetRefresh, TimeUnit.SECONDS);
 
-        // Start dedicated __consumer_offsets reader thread(s)
         offsetsIngestor.start();
 
-        // Periodic background immutable snapshot build
         int snapRefresh = Math.max(1, spec.collection().snapshotRefreshSeconds());
         this.snapshotTask = snapshotScheduler.scheduleWithFixedDelay(
                 this::refreshSnapshotSafe, 1L, snapRefresh, TimeUnit.SECONDS);
 
-        // Proactive expired-group purge every 5 minutes
         this.expiryTask = snapshotScheduler.scheduleWithFixedDelay(
                 this::purgeExpiredSafe, 300L, 300L, TimeUnit.SECONDS);
 
@@ -113,7 +129,7 @@ public class ClusterRuntime {
     }
 
     /**
-     * Applies non-connection policy changes in place without reconnecting or replaying {@code __consumer_offsets}.
+     * Applies non-structural policy changes in place without reconnecting or replaying.
      */
     public synchronized void hotPatch(ClusterSpec updatedSpec) {
         if (stopped.get()) {
@@ -122,8 +138,11 @@ public class ClusterRuntime {
         int oldOffsetSec = this.spec.collection().offsetRefreshSeconds();
         int oldSnapSec = this.spec.collection().snapshotRefreshSeconds();
         this.spec = updatedSpec;
-        this.store.applyPolicy(updatedSpec);
+        List<String> purgedGroups = this.store.applyPolicy(updatedSpec);
         this.evaluator.applyPolicy(updatedSpec);
+        for (String purged : purgedGroups) {
+            this.evaluator.invalidateGroup(purged);
+        }
         this.brokerCollector.applyPolicy(updatedSpec);
 
         if (started.get() && oldOffsetSec != updatedSpec.collection().offsetRefreshSeconds() && offsetTask != null) {
@@ -141,7 +160,8 @@ public class ClusterRuntime {
                     this::refreshSnapshotSafe, snapSec, snapSec, TimeUnit.SECONDS);
         }
         refreshSnapshotSafe();
-        log.info("Hot-patched ClusterRuntime target={} gen={}", targetKey.canonicalId(), generation);
+        log.info("Hot-patched ClusterRuntime target={} gen={} (purgedFilteredGroups={})",
+                targetKey.canonicalId(), generation, purgedGroups.size());
     }
 
     public boolean isDataReady() {
@@ -166,7 +186,7 @@ public class ClusterRuntime {
         log.info("Stopped ClusterRuntime target={} gen={}", targetKey.canonicalId(), generation);
     }
 
-    private void refreshSnapshotSafe() {
+    void refreshSnapshotSafe() {
         if (stopped.get()) {
             return;
         }
@@ -174,6 +194,8 @@ public class ClusterRuntime {
             latestSnapshot.set(buildSnapshot());
         } catch (Throwable t) {
             log.warn("Failed to build metrics snapshot for {}: {}", targetKey.canonicalId(), t.getMessage());
+            // Actively publish a degraded snapshot so scrapes never see stale dataReady=true (#15)
+            latestSnapshot.set(buildDegradedFallbackSnapshot("snapshot_build_failed: " + t.getClass().getSimpleName()));
         }
     }
 
@@ -191,7 +213,7 @@ public class ClusterRuntime {
         }
     }
 
-    private ClusterMetricsSnapshot buildSnapshot() {
+    protected ClusterMetricsSnapshot buildSnapshot() {
         long startNs = System.nanoTime();
         ClusterSpec currentSpec = this.spec;
         long nowMs = System.currentTimeMillis();
@@ -203,12 +225,16 @@ public class ClusterRuntime {
         boolean headFresh = collectionSuccess && lastSuccessSec > 0L && (nowSec - lastSuccessSec) <= maxAgeSec;
         boolean offsetsCaughtUp = offsetsIngestor.isCaughtUp();
         boolean reachable = brokerCollector.isReachable() && offsetsIngestor.isHealthy();
-        boolean dataReady = headFresh && offsetsCaughtUp && reachable;
+        boolean cardinalityReached = store.isCardinalityLimitReached();
+        // Cardinality limit exhaustion invalidates completeness -> cluster_up=0 / DEGRADED (#03)
+        boolean dataReady = headFresh && offsetsCaughtUp && reachable && !cardinalityReached;
 
-        ClusterPhase phase = determinePhase(dataReady, offsetsCaughtUp, reachable);
+        ClusterPhase phase = determinePhase(dataReady, offsetsCaughtUp, reachable, cardinalityReached);
         String errMsg = !offsetsIngestor.lastError().isEmpty()
                 ? offsetsIngestor.lastError()
-                : brokerCollector.lastError();
+                : (!brokerCollector.lastError().isEmpty()
+                ? brokerCollector.lastError()
+                : (cardinalityReached ? "cardinality_limit_reached" : ""));
 
         List<GroupEvaluation> groups = dataReady || phase == ClusterPhase.DEGRADED
                 ? evaluator.evaluateAllGroups()
@@ -228,12 +254,13 @@ public class ClusterRuntime {
                 offsetsIngestor.computeInternalOffsetsLag(),
                 store.trackedGroupCount(),
                 store.trackedPartitionCount(),
-                store.isCardinalityLimitReached(),
+                cardinalityReached,
                 generation,
                 errMsg
         );
 
         double buildSec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+        DurationHistogramSnapshot hist = observeBuildDuration(buildSec);
         return new ClusterMetricsSnapshot(
                 targetKey,
                 currentSpec,
@@ -242,17 +269,66 @@ public class ClusterRuntime {
                 topicOffsets,
                 offsetsIngestor.snapshotDecodeErrors(),
                 snapshotReconcileErrors(),
-                buildSec,
+                hist,
                 nowMs
         );
     }
 
-    private ClusterPhase determinePhase(boolean dataReady, boolean offsetsCaughtUp, boolean reachable) {
+    private ClusterMetricsSnapshot buildDegradedFallbackSnapshot(String errorMessage) {
+        ClusterMetricsSnapshot prev = latestSnapshot.get();
+        long nowMs = System.currentTimeMillis();
+        ClusterHealthSnapshot degraded = new ClusterHealthSnapshot(
+                ClusterPhase.DEGRADED,
+                false,
+                false,
+                offsetsIngestor.isCaughtUp(),
+                false,
+                false,
+                brokerCollector.lastCollectionSuccessEpochSec(),
+                offsetsIngestor.computeInternalOffsetsLag(),
+                store.trackedGroupCount(),
+                store.trackedPartitionCount(),
+                store.isCardinalityLimitReached(),
+                generation,
+                errorMessage
+        );
+        DurationHistogramSnapshot hist = prev != null
+                ? prev.snapshotBuildDurationHistogram()
+                : DurationHistogramSnapshot.empty();
+        return new ClusterMetricsSnapshot(
+                targetKey,
+                this.spec,
+                degraded,
+                List.of(),
+                Map.of(),
+                offsetsIngestor.snapshotDecodeErrors(),
+                snapshotReconcileErrors(),
+                hist,
+                nowMs
+        );
+    }
+
+    private synchronized DurationHistogramSnapshot observeBuildDuration(double seconds) {
+        double[] bounds = DurationHistogramSnapshot.DEFAULT_BUCKETS;
+        for (int i = 0; i < bounds.length; i++) {
+            if (seconds <= bounds[i]) {
+                durationBucketCounts[i]++;
+                break;
+            }
+        }
+        durationSumSeconds += seconds;
+        return new DurationHistogramSnapshot(bounds, Arrays.copyOf(durationBucketCounts, durationBucketCounts.length), durationSumSeconds);
+    }
+
+    private ClusterPhase determinePhase(boolean dataReady, boolean offsetsCaughtUp, boolean reachable, boolean cardinalityReached) {
         if (stopped.get()) {
             return ClusterPhase.STOPPED;
         }
         if (offsetsIngestor.isWaitingForTopic()) {
             return ClusterPhase.WAITING_OFFSETS_TOPIC;
+        }
+        if (cardinalityReached) {
+            return ClusterPhase.DEGRADED;
         }
         if (!offsetsCaughtUp) {
             return brokerCollector.isInitialMetadataLoaded() ? ClusterPhase.REPLAYING : ClusterPhase.INITIALIZING;

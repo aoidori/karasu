@@ -7,6 +7,7 @@ package io.karasu.exporter.metrics;
 import io.karasu.core.collector.ClusterManager;
 import io.karasu.core.snapshot.ClusterMetricsSnapshot;
 import io.karasu.core.snapshot.ClusterMetricsSnapshot.DecodeErrorKey;
+import io.karasu.core.snapshot.ClusterMetricsSnapshot.DurationHistogramSnapshot;
 import io.karasu.exporter.labels.LabelNormalizer;
 import io.karasu.protocol.model.ClusterHealthSnapshot;
 import io.karasu.protocol.model.ClusterPhase;
@@ -14,24 +15,32 @@ import io.karasu.protocol.model.ClusterTargetKey;
 import io.karasu.protocol.model.GroupEvaluation;
 import io.karasu.protocol.model.PartitionEvaluation;
 import io.prometheus.metrics.model.registry.MultiCollector;
+import io.prometheus.metrics.model.snapshots.ClassicHistogramBuckets;
 import io.prometheus.metrics.model.snapshots.CounterSnapshot;
 import io.prometheus.metrics.model.snapshots.CounterSnapshot.CounterDataPointSnapshot;
 import io.prometheus.metrics.model.snapshots.GaugeSnapshot;
 import io.prometheus.metrics.model.snapshots.GaugeSnapshot.GaugeDataPointSnapshot;
+import io.prometheus.metrics.model.snapshots.HistogramSnapshot;
+import io.prometheus.metrics.model.snapshots.HistogramSnapshot.HistogramDataPointSnapshot;
 import io.prometheus.metrics.model.snapshots.Labels;
 import io.prometheus.metrics.model.snapshots.MetricSnapshots;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Lock-free Prometheus {@link MultiCollector} that streams Karasu's immutable per-cluster snapshots
- * directly into OpenMetrics / Prometheus text snapshots.
+ * Lock-free Prometheus {@link MultiCollector} streaming Karasu's immutable per-cluster snapshots.
  *
- * <p>Because every scrape reads freshly published immutable snapshots rather than mutating global
- * Gauge registries, expired groups, deleted topics, and hot-removed clusters vanish immediately
- * without stale-series leaks or scrape-time mutex contention.
+ * <p>Hardening guarantees:
+ * <ul>
+ *   <li>Per-cluster label resolution errors are isolated so one cluster never breaks the scrape (#12).</li>
+ *   <li>Snapshot staleness is verified against wall clock on every scrape (#15).</li>
+ *   <li>Incomplete groups (cardinality limit or unresolved topics) omit partial {@code lag_sum} (#03),
+ *       and uncommitted partitions never emit synthetic zero lag (#09).</li>
+ *   <li>{@code karasu_snapshot_build_duration_seconds} is exposed as a standard Prometheus Histogram (#18).</li>
+ * </ul>
  */
 public final class KarasuPrometheusCollector implements MultiCollector {
 
@@ -53,6 +62,7 @@ public final class KarasuPrometheusCollector implements MultiCollector {
     private final ClusterManager clusterManager;
     private final LabelNormalizer labelNormalizer;
     private final ExporterOptions options;
+    private final Clock clock;
 
     public record ExporterOptions(
             String metricPrefix,
@@ -67,9 +77,17 @@ public final class KarasuPrometheusCollector implements MultiCollector {
     public KarasuPrometheusCollector(ClusterManager clusterManager,
                                      LabelNormalizer labelNormalizer,
                                      ExporterOptions options) {
+        this(clusterManager, labelNormalizer, options, Clock.systemUTC());
+    }
+
+    public KarasuPrometheusCollector(ClusterManager clusterManager,
+                                     LabelNormalizer labelNormalizer,
+                                     ExporterOptions options,
+                                     Clock clock) {
         this.clusterManager = clusterManager;
         this.labelNormalizer = labelNormalizer;
         this.options = options;
+        this.clock = clock;
     }
 
     @Override
@@ -94,16 +112,28 @@ public final class KarasuPrometheusCollector implements MultiCollector {
     }
 
     MetricSnapshots collectSnapshots(List<ClusterMetricsSnapshot> snapshots) {
-        // Resolve cluster-level extra labels and compute unified schema keys
+        long nowMs = clock.millis();
+
+        // Compute effective health (enforcing snapshot age freshness at scrape time, #15)
+        // and scrape-safe extra labels (#12)
+        boolean[] effectiveDataReady = new boolean[snapshots.size()];
+        ClusterPhase[] effectivePhases = new ClusterPhase[snapshots.size()];
         List<Map<String, String>> clusterExtras = new ArrayList<>(snapshots.size());
         List<Map<String, String>> allGroupExtrasObserved = new ArrayList<>();
-        for (ClusterMetricsSnapshot snap : snapshots) {
-            Map<String, String> cExtra = labelNormalizer.resolveClusterExtraLabels(snap.spec());
+
+        for (int i = 0; i < snapshots.size(); i++) {
+            ClusterMetricsSnapshot snap = snapshots.get(i);
+            boolean snapshotStale = isSnapshotStale(snap, nowMs);
+            effectiveDataReady[i] = !snapshotStale && snap.health().dataReady();
+            effectivePhases[i] = snapshotStale ? ClusterPhase.DEGRADED : snap.health().phase();
+
+            Map<String, String> cExtra = labelNormalizer.resolveClusterExtraLabelsSafe(snap.spec());
             clusterExtras.add(cExtra);
             allGroupExtrasObserved.add(cExtra);
-            if (shouldPublishBusinessMetrics(snap)) {
+
+            if (shouldPublishBusinessMetrics(effectiveDataReady[i], effectivePhases[i])) {
                 for (GroupEvaluation g : snap.groups()) {
-                    Map<String, String> gExtra = labelNormalizer.resolveGroupExtraLabels(snap.spec(), cExtra, g.group());
+                    Map<String, String> gExtra = labelNormalizer.resolveGroupExtraLabelsSafe(snap.spec(), cExtra, g.group());
                     if (gExtra != cExtra) {
                         allGroupExtrasObserved.add(gExtra);
                     }
@@ -119,13 +149,13 @@ public final class KarasuPrometheusCollector implements MultiCollector {
         // Business metric builders
         GaugeSnapshot.Builder consumerLagSum = GaugeSnapshot.builder()
                 .name(p + "_consumer_lag_sum")
-                .help("Sum of all partition current lag values for the consumer group.");
+                .help("Sum of all partition current lag values for the consumer group (emitted only when complete).");
         GaugeSnapshot.Builder consumerStatus = GaugeSnapshot.builder()
                 .name(p + "_consumer_status")
                 .help("Consumer group evaluation status (0=NOTFOUND, 1=OK, 2=WARN, 3=ERR).");
         GaugeSnapshot.Builder partitionLag = GaugeSnapshot.builder()
                 .name(p + "_consumer_partition_lag")
-                .help("Approximate message lag for a consumer group topic-partition.");
+                .help("Approximate message lag for a committed consumer group topic-partition.");
         GaugeSnapshot.Builder partitionCurrentOffset = GaugeSnapshot.builder()
                 .name(p + "_consumer_current_offset")
                 .help("Latest committed offset stored for this consumer group topic-partition.");
@@ -139,7 +169,7 @@ public final class KarasuPrometheusCollector implements MultiCollector {
         // Cluster health & capacity metric builders
         GaugeSnapshot.Builder clusterUp = GaugeSnapshot.builder()
                 .name("karasu_cluster_up")
-                .help("Per-cluster collection quality gate (1=head fresh, offsets caught up, and reachable; 0=unhealthy/replaying).");
+                .help("Per-cluster collection quality gate (1=fresh, caught up, reachable, within limits; 0=unhealthy/replaying).");
         GaugeSnapshot.Builder clusterState = GaugeSnapshot.builder()
                 .name("karasu_cluster_state")
                 .help("One-hot indicator of current per-cluster lifecycle phase.");
@@ -151,7 +181,7 @@ public final class KarasuPrometheusCollector implements MultiCollector {
                 .help("Unix timestamp in seconds of the last complete broker head-offset cycle.");
         GaugeSnapshot.Builder offsetsCaughtUp = GaugeSnapshot.builder()
                 .name("karasu_cluster_offsets_caught_up")
-                .help("Internal __consumer_offsets reader completed replay catch-up (1/0).");
+                .help("Internal __consumer_offsets reader completed replay catch-up without runtime stall (1/0).");
         GaugeSnapshot.Builder offsetsLag = GaugeSnapshot.builder()
                 .name("karasu_cluster_offsets_lag")
                 .help("Remaining unread records across assigned __consumer_offsets partitions.");
@@ -164,10 +194,9 @@ public final class KarasuPrometheusCollector implements MultiCollector {
         GaugeSnapshot.Builder cardinalityLimit = GaugeSnapshot.builder()
                 .name("karasu_cluster_cardinality_limit_reached")
                 .help("Whether this cluster reached its configured memory guardrail limit (1/0).");
-        GaugeSnapshot.Builder snapshotBuildDuration = GaugeSnapshot.builder()
+        HistogramSnapshot.Builder snapshotBuildDuration = HistogramSnapshot.builder()
                 .name("karasu_snapshot_build_duration_seconds")
-                .help("Duration in seconds of the latest background metrics snapshot build.");
-        // OpenMetrics/Prometheus 1.x automatically appends "_total" when rendering CounterSnapshot
+                .help("Histogram of background metrics snapshot build durations in seconds.");
         CounterSnapshot.Builder decodeErrors = CounterSnapshot.builder()
                 .name("karasu_cluster_decode_errors")
                 .help("Total __consumer_offsets record decode failures or unknown key versions.");
@@ -175,7 +204,9 @@ public final class KarasuPrometheusCollector implements MultiCollector {
                 .name("karasu_cluster_reconcile_errors")
                 .help("Total cluster hot-reload validation or swap failures.");
 
-        boolean hasBusinessLag = false;
+        boolean hasGroupLagSum = false;
+        boolean hasGroupStatus = false;
+        boolean hasPartitionLag = false;
         boolean hasPartitionOffset = false;
         boolean hasTopicOffset = false;
         boolean hasDecodeErrors = false;
@@ -186,9 +217,11 @@ public final class KarasuPrometheusCollector implements MultiCollector {
             ClusterTargetKey target = snap.targetKey();
             Map<String, String> cExtra = clusterExtras.get(i);
             ClusterHealthSnapshot h = snap.health();
+            boolean dataReady = effectiveDataReady[i];
+            ClusterPhase phase = effectivePhases[i];
 
             Labels baseLabels = labelNormalizer.buildLabels(target, EMPTY, EMPTY, unifiedClusterExtraKeys, cExtra);
-            clusterUp.dataPoint(gaugePoint(baseLabels, h.dataReady() ? 1.0 : 0.0));
+            clusterUp.dataPoint(gaugePoint(baseLabels, dataReady ? 1.0 : 0.0));
             collectionSuccess.dataPoint(gaugePoint(baseLabels, h.collectionSuccess() ? 1.0 : 0.0));
             collectionLastSuccess.dataPoint(gaugePoint(baseLabels, (double) h.lastCollectionSuccessEpochSec()));
             offsetsCaughtUp.dataPoint(gaugePoint(baseLabels, h.offsetsCaughtUp() ? 1.0 : 0.0));
@@ -196,12 +229,20 @@ public final class KarasuPrometheusCollector implements MultiCollector {
             trackedGroups.dataPoint(gaugePoint(baseLabels, (double) h.trackedGroups()));
             trackedPartitions.dataPoint(gaugePoint(baseLabels, (double) h.trackedPartitions()));
             cardinalityLimit.dataPoint(gaugePoint(baseLabels, h.cardinalityLimitReached() ? 1.0 : 0.0));
-            snapshotBuildDuration.dataPoint(gaugePoint(baseLabels, snap.lastSnapshotBuildDurationSeconds()));
 
-            for (ClusterPhase phase : EXPOSED_PHASES) {
+            DurationHistogramSnapshot hist = snap.snapshotBuildDurationHistogram() != null
+                    ? snap.snapshotBuildDurationHistogram()
+                    : DurationHistogramSnapshot.empty();
+            snapshotBuildDuration.dataPoint(HistogramDataPointSnapshot.builder()
+                    .labels(baseLabels)
+                    .classicHistogramBuckets(ClassicHistogramBuckets.of(hist.upperBounds(), hist.bucketCounts()))
+                    .sum(hist.sumSeconds())
+                    .build());
+
+            for (ClusterPhase pItem : EXPOSED_PHASES) {
                 Labels stateLabels = labelNormalizer.buildLabels(
-                        target, STATE_NAME, new String[]{phase.name()}, unifiedClusterExtraKeys, cExtra);
-                clusterState.dataPoint(gaugePoint(stateLabels, h.phase() == phase ? 1.0 : 0.0));
+                        target, STATE_NAME, new String[]{pItem.name()}, unifiedClusterExtraKeys, cExtra);
+                clusterState.dataPoint(gaugePoint(stateLabels, phase == pItem ? 1.0 : 0.0));
             }
 
             for (Map.Entry<DecodeErrorKey, Long> err : snap.decodeErrorCounts().entrySet()) {
@@ -224,21 +265,29 @@ public final class KarasuPrometheusCollector implements MultiCollector {
                 hasReconcileErrors = true;
             }
 
-            // Quality gate: suppress stale business lag metrics when cluster is not ready/fresh
-            if (!shouldPublishBusinessMetrics(snap)) {
+            // Quality gate: suppress stale/incomplete business lag metrics when cluster is unhealthy (#03, #15)
+            if (!shouldPublishBusinessMetrics(dataReady, phase)) {
                 continue;
             }
 
             for (GroupEvaluation group : snap.groups()) {
-                Map<String, String> gExtra = labelNormalizer.resolveGroupExtraLabels(snap.spec(), cExtra, group.group());
+                Map<String, String> gExtra = labelNormalizer.resolveGroupExtraLabelsSafe(snap.spec(), cExtra, group.group());
                 Labels groupLabels = labelNormalizer.buildLabels(
                         target, GROUP_NAME, new String[]{group.group()}, unifiedGroupExtraKeys, gExtra);
 
-                consumerLagSum.dataPoint(gaugePoint(groupLabels, (double) group.totalLag()));
-                consumerStatus.dataPoint(gaugePoint(groupLabels, (double) group.status().code()));
-                hasBusinessLag = true;
+                // Omit partial lag_sum when group is incomplete or has no committed partitions (#03, #09)
+                if (group.lagTotalComplete()) {
+                    consumerLagSum.dataPoint(gaugePoint(groupLabels, (double) group.totalLag()));
+                    hasGroupLagSum = true;
+                    consumerStatus.dataPoint(gaugePoint(groupLabels, (double) group.status().code()));
+                    hasGroupStatus = true;
+                }
 
                 for (PartitionEvaluation part : group.partitions()) {
+                    // Never emit synthetic lag=0 for uncommitted partitions (#09)
+                    if (!part.hasKnownLag()) {
+                        continue;
+                    }
                     Labels partLabels = labelNormalizer.buildLabels(
                             target,
                             PARTITION_NAMES,
@@ -246,6 +295,7 @@ public final class KarasuPrometheusCollector implements MultiCollector {
                             unifiedGroupExtraKeys,
                             gExtra);
                     partitionLag.dataPoint(gaugePoint(partLabels, (double) part.currentLag()));
+                    hasPartitionLag = true;
 
                     boolean windowReady = !options.requireCompleteWindowForOffset() || part.complete() == 1.0f;
                     if (windowReady && part.end() != null) {
@@ -294,9 +344,13 @@ public final class KarasuPrometheusCollector implements MultiCollector {
         if (hasReconcileErrors) {
             out.metricSnapshot(reconcileErrors.build());
         }
-        if (hasBusinessLag) {
+        if (hasGroupLagSum) {
             out.metricSnapshot(consumerLagSum.build());
+        }
+        if (hasGroupStatus) {
             out.metricSnapshot(consumerStatus.build());
+        }
+        if (hasPartitionLag) {
             out.metricSnapshot(partitionLag.build());
         }
         if (hasPartitionOffset) {
@@ -309,11 +363,19 @@ public final class KarasuPrometheusCollector implements MultiCollector {
         return out.build();
     }
 
-    private boolean shouldPublishBusinessMetrics(ClusterMetricsSnapshot snap) {
-        if (snap.health().dataReady()) {
+    private boolean isSnapshotStale(ClusterMetricsSnapshot snap, long nowMs) {
+        if (snap.builtAtEpochMs() <= 0L) {
             return true;
         }
-        return options.publishStaleOnDegraded() && snap.health().phase() == ClusterPhase.DEGRADED;
+        long maxAgeMs = Math.max(snap.spec().collection().snapshotRefreshSeconds() * 3_000L, 60_000L);
+        return (nowMs - snap.builtAtEpochMs()) > maxAgeMs;
+    }
+
+    private boolean shouldPublishBusinessMetrics(boolean dataReady, ClusterPhase phase) {
+        if (dataReady) {
+            return true;
+        }
+        return options.publishStaleOnDegraded() && phase == ClusterPhase.DEGRADED;
     }
 
     private static GaugeDataPointSnapshot gaugePoint(Labels labels, double value) {

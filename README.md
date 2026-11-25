@@ -24,7 +24,7 @@ It preserves Burrow's core strength—consuming Kafka's internal `__consumer_off
 - **Extensible Multi-Dimensional Labels**:
   - Mandatory `k8s_cluster` and `kafka_cluster` labels (with composite target key `(k8s_cluster, kafka_cluster)` preventing cross-K8s name collisions).
   - Three-layer label extensibility: global `common-labels`, per-cluster `labels`, and programmatic `MetricLabelEnricher` SPI with unified OpenMetrics schema normalization.
-- **Clean Apache-2.0 Licensing**: Full dependency tree strictly kept to Apache-2.0 / MIT / BSD (Log4j2 instead of Logback, no MPL/GPL dependencies) with built-in CycloneDX SBOM generation.
+- **Transparent Open-Source Licensing & CI Gate**: Apache-2.0 project license with automated CycloneDX SBOM generation and CI runtime license allowlist verification (`Apache-2.0`, `MIT`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, `CC0-1.0`, plus standard Jakarta API spec dual-license `EPL-2.0 / GPL-2.0-with-classpath-exception`; Log4j2 replaces Logback; zero MPL/LGPL/AGPL/plain-GPL dependencies).
 
 ## Architecture
 

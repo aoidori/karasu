@@ -75,6 +75,8 @@ public final class BrokerOffsetCollector {
     private final AtomicReference<String> lastError = new AtomicReference<>("");
     private final AtomicLong lastMetadataRefreshMs = new AtomicLong(0L);
     private final AtomicLong lastReaperRunMs = new AtomicLong(0L);
+    private final AtomicLong lastImmediateRefreshTriggerMs = new AtomicLong(0L);
+    private volatile java.util.concurrent.ScheduledExecutorService asyncScheduler;
 
     // Current known online partitions per topic (updated only on single-threaded poll ticks)
     private volatile Map<String, List<Integer>> knownOnlinePartitions = Map.of();
@@ -90,6 +92,26 @@ public final class BrokerOffsetCollector {
         this.store = store;
         this.onTopicDeletedOrReaped = onTopicDeletedOrReaped;
         applyPolicy(spec);
+    }
+
+    public void attachScheduler(java.util.concurrent.ScheduledExecutorService scheduler) {
+        this.asyncScheduler = scheduler;
+    }
+
+    /**
+     * Requests a debounced immediate metadata + head-offset refresh when a commit arrives
+     * for a newly created topic not yet present in the metadata snapshot (#01).
+     */
+    public void requestImmediateMetadataRefresh() {
+        forceMetadataRefresh.set(true);
+        if (closed.get() || asyncScheduler == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long prev = lastImmediateRefreshTriggerMs.get();
+        if (now - prev >= 2_000L && lastImmediateRefreshTriggerMs.compareAndSet(prev, now)) {
+            asyncScheduler.execute(this::collectOnce);
+        }
     }
 
     public void applyPolicy(ClusterSpec spec) {
@@ -209,6 +231,7 @@ public final class BrokerOffsetCollector {
             Map<String, List<Integer>> nextOnline = new HashMap<>();
             Map<String, Integer> nextCounts = new HashMap<>();
 
+            boolean recreatedAny = false;
             for (int i = 0; i < filtered.size(); i += DESCRIBE_BATCH_SIZE) {
                 List<String> batch = filtered.subList(i, Math.min(filtered.size(), i + DESCRIBE_BATCH_SIZE));
                 Map<String, TopicDescription> described = admin.describeTopics(
@@ -221,7 +244,9 @@ public final class BrokerOffsetCollector {
                     TopicDescription td = entry.getValue();
                     UUID javaUuid = toJavaUuid(td.topicId());
                     int partCount = td.partitions().size();
-                    store.updateTopicMetadata(topic, javaUuid, partCount);
+                    if (store.updateTopicMetadata(topic, javaUuid, partCount)) {
+                        recreatedAny = true;
+                    }
 
                     List<Integer> onlineParts = new ArrayList<>(partCount);
                     for (TopicPartitionInfo pInfo : td.partitions()) {
@@ -243,7 +268,7 @@ public final class BrokerOffsetCollector {
                     deletedAny = true;
                 }
             }
-            if (deletedAny && onTopicDeletedOrReaped != null) {
+            if ((deletedAny || recreatedAny) && onTopicDeletedOrReaped != null) {
                 onTopicDeletedOrReaped.run();
             }
 

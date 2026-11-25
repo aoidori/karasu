@@ -9,6 +9,8 @@ import io.karasu.core.config.ClusterSpecValidator;
 import io.karasu.core.spi.MetricLabelEnricher;
 import io.karasu.protocol.model.ClusterTargetKey;
 import io.prometheus.metrics.model.snapshots.Labels;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,9 +27,12 @@ import java.util.TreeSet;
  *   <li>L2 per-cluster {@code labels}</li>
  *   <li>L3 programmatic {@link MetricLabelEnricher} SPI beans</li>
  * </ol>
- * Guarantees a uniform label key schema across every data point in a Prometheus metric family.
+ * Guarantees uniform label schemas across every data point in a metric family, supports pre-activation
+ * merged validation (#12), and isolates per-cluster runtime enricher errors so one cluster never breaks scrape.
  */
 public final class LabelNormalizer {
+
+    private static final Logger log = LoggerFactory.getLogger(LabelNormalizer.class);
 
     private final Map<String, String> commonLabels;
     private final List<String> declaredExtraLabelKeys;
@@ -50,9 +55,18 @@ public final class LabelNormalizer {
     }
 
     /**
-     * Resolves merged extra labels for one cluster (L1 < L2 < L3) and validates against reserved collisions.
+     * Validates merged L1 + L2 + L3 cluster labels BEFORE a cluster spec is activated (#12).
+     * Throws {@link IllegalArgumentException} if merged label count exceeds {@code maxExtraLabels}
+     * or any key is invalid/reserved.
      */
-    public Map<String, String> resolveClusterExtraLabels(ClusterSpec spec) {
+    public void validateMergedClusterSpec(ClusterSpec spec) {
+        resolveClusterExtraLabelsStrict(spec);
+    }
+
+    /**
+     * Strict merged cluster label resolution (throws on limit/validation violation).
+     */
+    public Map<String, String> resolveClusterExtraLabelsStrict(ClusterSpec spec) {
         Map<String, String> merged = new LinkedHashMap<>(commonLabels);
         merged.putAll(spec.labels());
         for (MetricLabelEnricher enricher : enrichers) {
@@ -66,35 +80,51 @@ public final class LabelNormalizer {
     }
 
     /**
-     * Resolves merged extra labels for a specific consumer group (cluster labels + L3 group enrichers).
+     * Scrape-safe cluster label resolution (#12): if a dynamic enricher or unvalidated spec ever exceeds
+     * label limits at scrape time, falls back to validated {@code commonLabels} instead of aborting the whole scrape.
      */
-    public Map<String, String> resolveGroupExtraLabels(ClusterSpec spec,
-                                                       Map<String, String> clusterExtra,
-                                                       String consumerGroup) {
-        if (enrichers.isEmpty()) {
-            return clusterExtra;
+    public Map<String, String> resolveClusterExtraLabelsSafe(ClusterSpec spec) {
+        try {
+            return resolveClusterExtraLabelsStrict(spec);
+        } catch (RuntimeException ex) {
+            log.error("Isolating label validation failure for cluster {} during scrape (falling back to commonLabels): {}",
+                    spec.targetKey().canonicalId(), ex.getMessage());
+            return commonLabels;
         }
-        Map<String, String> merged = null;
-        for (MetricLabelEnricher enricher : enrichers) {
-            Map<String, String> dynamic = enricher.enrichGroupLabels(spec, consumerGroup);
-            if (dynamic != null && !dynamic.isEmpty()) {
-                if (merged == null) {
-                    merged = new LinkedHashMap<>(clusterExtra);
-                }
-                merged.putAll(dynamic);
-            }
-        }
-        if (merged == null) {
-            return clusterExtra;
-        }
-        ClusterSpecValidator.validateExtraLabels(merged, maxExtraLabels, spec.targetKey().canonicalId() + "/" + consumerGroup);
-        return merged;
     }
 
     /**
-     * Computes the deterministic sorted union of declared and observed extra label keys across snapshots
-     * so every data point in a metric family shares an identical label schema.
+     * Scrape-safe group label resolution (#12).
      */
+    public Map<String, String> resolveGroupExtraLabelsSafe(ClusterSpec spec,
+                                                           Map<String, String> clusterExtra,
+                                                           String consumerGroup) {
+        if (enrichers.isEmpty()) {
+            return clusterExtra;
+        }
+        try {
+            Map<String, String> merged = null;
+            for (MetricLabelEnricher enricher : enrichers) {
+                Map<String, String> dynamic = enricher.enrichGroupLabels(spec, consumerGroup);
+                if (dynamic != null && !dynamic.isEmpty()) {
+                    if (merged == null) {
+                        merged = new LinkedHashMap<>(clusterExtra);
+                    }
+                    merged.putAll(dynamic);
+                }
+            }
+            if (merged == null) {
+                return clusterExtra;
+            }
+            ClusterSpecValidator.validateExtraLabels(merged, maxExtraLabels, spec.targetKey().canonicalId() + "/" + consumerGroup);
+            return merged;
+        } catch (RuntimeException ex) {
+            log.error("Isolating group label validation failure for {}/{} during scrape (falling back to cluster labels): {}",
+                    spec.targetKey().canonicalId(), consumerGroup, ex.getMessage());
+            return clusterExtra;
+        }
+    }
+
     public List<String> computeUnifiedExtraKeys(List<Map<String, String>> observedMaps) {
         TreeSet<String> keys = new TreeSet<>(declaredExtraLabelKeys);
         for (Map<String, String> map : observedMaps) {
@@ -103,10 +133,6 @@ public final class LabelNormalizer {
         return new ArrayList<>(keys);
     }
 
-    /**
-     * Builds immutable Prometheus {@link Labels} combining mandatory {@code k8s_cluster}, {@code kafka_cluster},
-     * fixed metric-specific pairs, and normalized extra labels (filling {@code ""} when absent).
-     */
     public Labels buildLabels(ClusterTargetKey targetKey,
                               String[] fixedNames,
                               String[] fixedValues,

@@ -66,6 +66,8 @@ public record ClusterSpec(
                 .append(collection.isolationLevel()).append('|')
                 .append(collection.offsetsTopic()).append('|')
                 .append(collection.offsetsConsumerThreads()).append('\n');
+        // Window capacity (intervals) is structural to ring buffers; changing it requires Blue-Green rebuild
+        sb.append("intervals=").append(evaluation.intervals()).append('\n');
         for (Map.Entry<String, String> e : extraKafkaProperties.entrySet()) {
             sb.append("prop.").append(e.getKey()).append('=').append(e.getValue()).append('\n');
         }

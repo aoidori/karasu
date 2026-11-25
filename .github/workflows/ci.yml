@@ -22,3 +22,37 @@ jobs:
 
       - name: Build, Test, and Generate SBOM
         run: mvn -B clean verify org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
+
+      - name: Enforce Runtime Dependency License Allowlist
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          # Runtime license allowlist: permissive licenses + standard Jakarta API spec dual-license (EPL-2.0 / GPL-2.0-with-classpath-exception)
+          ALLOWED = {
+              "Apache-2.0",
+              "MIT",
+              "BSD-2-Clause",
+              "BSD-3-Clause",
+              "ISC",
+              "CC0-1.0",
+              "EPL-2.0",
+              "GPL-2.0-with-classpath-exception",
+          }
+
+          bom = json.load(open("target/sbom-java.cdx.json"))
+          violations = []
+          for comp in bom.get("components", []):
+              licenses = [
+                  (entry.get("license", {}).get("id") or entry.get("license", {}).get("name") or "UNKNOWN")
+                  for entry in comp.get("licenses", [])
+              ]
+              if not licenses or not any(lic in ALLOWED for lic in licenses):
+                  violations.append((comp.get("purl"), licenses))
+          if violations:
+              print("Disallowed licenses detected in SBOM:", file=sys.stderr)
+              for purl, lics in violations:
+                  print(f"  - {purl}: {lics}", file=sys.stderr)
+              sys.exit(1)
+          print(f"License allowlist check passed for {len(bom.get('components', []))} components.")
+          EOF

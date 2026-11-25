@@ -8,6 +8,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.karasu.core.config.ClusterSpec;
 import io.karasu.core.storage.ClusterStore;
+import io.karasu.core.storage.ClusterStore.GroupSnapshot;
 import io.karasu.core.storage.ClusterStore.PartitionSnapshot;
 import io.karasu.protocol.model.ClusterTargetKey;
 import io.karasu.protocol.model.CommitSample;
@@ -22,7 +23,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Per-cluster evaluator with bounded Caffeine cache, supporting active invalidation and hot-patched thresholds.
+ * Per-cluster evaluator with bounded Caffeine cache, supporting active invalidation,
+ * uncommitted-partition distinction, and incomplete-group protection.
  */
 public final class LagEvaluator {
 
@@ -63,6 +65,10 @@ public final class LagEvaluator {
     }
 
     public GroupEvaluation evaluateGroup(String group) {
+        if (!store.acceptsGroup(group)) {
+            cache.invalidate(group);
+            return null;
+        }
         GroupEvaluation cached = cache.getIfPresent(group);
         if (cached != null) {
             return cached;
@@ -77,6 +83,9 @@ public final class LagEvaluator {
     public List<GroupEvaluation> evaluateAllGroups() {
         List<GroupEvaluation> results = new ArrayList<>();
         for (String group : store.consumerGroupNames()) {
+            if (!store.acceptsGroup(group)) {
+                continue;
+            }
             GroupEvaluation eval = evaluateGroup(group);
             if (eval != null && eval.status() != StatusCode.NOTFOUND) {
                 results.add(eval);
@@ -87,15 +96,17 @@ public final class LagEvaluator {
 
     private GroupEvaluation computeGroupStatus(String group) {
         long nowMs = clock.millis();
-        Map<String, List<PartitionSnapshot>> topics = store.fetchConsumer(group, nowMs);
-        if (topics == null) {
+        GroupSnapshot snapshot = store.fetchConsumerSnapshot(group, nowMs);
+        if (snapshot == null) {
             return null;
         }
 
+        Map<String, List<PartitionSnapshot>> topics = snapshot.topics();
         long nowSec = nowMs / 1000L;
         StatusCode groupStatus = StatusCode.OK;
         long totalLag = 0L;
         int totalPartitions = 0;
+        int committedPartitions = 0;
         int completePartitions = 0;
         PartitionEvaluation maxLag = null;
         List<PartitionEvaluation> allPartitions = new ArrayList<>();
@@ -106,13 +117,16 @@ public final class LagEvaluator {
                 PartitionEvaluation pe = evaluatePartition(topic, ps, nowSec);
                 allPartitions.add(pe);
                 totalPartitions++;
-                totalLag += pe.currentLag();
 
+                if (pe.hasKnownLag()) {
+                    committedPartitions++;
+                    totalLag += pe.currentLag();
+                    if (maxLag == null || pe.currentLag() > maxLag.currentLag()) {
+                        maxLag = pe;
+                    }
+                }
                 if (pe.status().code() > groupStatus.code()) {
                     groupStatus = pe.status().code() > StatusCode.ERR.code() ? StatusCode.ERR : pe.status();
-                }
-                if (maxLag == null || pe.currentLag() > maxLag.currentLag()) {
-                    maxLag = pe;
                 }
                 if (pe.complete() == 1.0f) {
                     completePartitions++;
@@ -120,6 +134,9 @@ public final class LagEvaluator {
             }
         }
 
+        // Group total lag is considered complete only if no partitions were truncated/unresolved
+        // and at least one committed partition exists (#03, #09).
+        boolean lagTotalComplete = !snapshot.incomplete() && committedPartitions > 0;
         float groupComplete = totalPartitions > 0 ? ((float) completePartitions / (float) totalPartitions) : 0.0f;
         return new GroupEvaluation(
                 targetKey,
@@ -129,16 +146,17 @@ public final class LagEvaluator {
                 List.copyOf(allPartitions),
                 totalPartitions,
                 maxLag,
-                totalLag
+                totalLag,
+                lagTotalComplete
         );
     }
 
     private PartitionEvaluation evaluatePartition(String topic, PartitionSnapshot ps, long nowSec) {
         CommitSample[] commits = ps.commits();
-        if (commits.length == 0) {
+        if (!ps.hasCommit() || commits.length == 0) {
             return new PartitionEvaluation(
                     topic, ps.partition(), ps.owner(), ps.clientId(),
-                    StatusCode.OK, null, null, ps.currentLag(), 0.0f
+                    StatusCode.OK, null, null, PartitionEvaluation.UNKNOWN_LAG, 0.0f, false
             );
         }
 
@@ -161,7 +179,8 @@ public final class LagEvaluator {
                 commits[0],
                 commits[commits.length - 1],
                 ps.currentLag(),
-                complete
+                complete,
+                true
         );
     }
 }

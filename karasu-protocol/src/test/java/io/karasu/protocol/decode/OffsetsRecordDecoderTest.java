@@ -5,12 +5,13 @@
 package io.karasu.protocol.decode;
 
 import io.karasu.protocol.decode.DecodedRecord.ClassicGroupMetadataRecord;
+import io.karasu.protocol.decode.DecodedRecord.ClassicGroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.DecodeFailureRecord;
-import io.karasu.protocol.decode.DecodedRecord.GroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.IgnoredInternalRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848AssignmentTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848CurrentAssignmentRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848GroupMetadataRecord;
+import io.karasu.protocol.decode.DecodedRecord.Kip848GroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848MemberMetadataRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848MemberTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.OffsetCommitRecord;
@@ -130,11 +131,11 @@ class OffsetsRecordDecoderTest {
     }
 
     @Test
-    void decodesGroupTombstonesForClassicAndKip848() throws Exception {
+    void decodesDistinctGroupTombstonesForClassicAndKip848() throws Exception {
         assertThat(decoder.decode(encodeGroupKey((short) 2, "g-classic"), null))
-                .isEqualTo(new GroupTombstoneRecord("g-classic"));
+                .isEqualTo(new ClassicGroupTombstoneRecord("g-classic"));
         assertThat(decoder.decode(encodeGroupKey((short) 3, "g-modern"), null))
-                .isEqualTo(new GroupTombstoneRecord("g-modern"));
+                .isEqualTo(new Kip848GroupTombstoneRecord("g-modern"));
         assertThat(decoder.decode(encodeGroupKey((short) 3, "g-modern"), new byte[]{0, 0, 0, 0, 0, 1}))
                 .isEqualTo(new Kip848GroupMetadataRecord("g-modern"));
     }

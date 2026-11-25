@@ -30,7 +30,7 @@
 
 ## 2. 技术栈与合规清单
 
-所有核心依赖均为 **Apache-2.0 / MIT / BSD**，规避原 Go 版本的 MPL-2.0 间接依赖以及 Logback（EPL/LGPL）等法务敏感项：
+面向云厂商商用及内网离线交付，核心运行依赖通过 CI 自动执行 CycloneDX SBOM 许可证白名单门禁：允许 **Apache-2.0 / MIT / BSD / ISC / CC0-1.0** 及标准 Jakarta 规范接口双许可（**EPL-2.0 / GPL-2.0-with-classpath-exception**，如 `jakarta.annotation-api`），严格拒绝 MPL-2.0、LGPL、AGPL 及无 CPE 例外的 GPL 组件（日志框架用 Apache Log4j2 替换默认 Logback）：
 
 | 模块/能力 | 选型 | 许可证 | 说明 |
 |---|---|---|---|

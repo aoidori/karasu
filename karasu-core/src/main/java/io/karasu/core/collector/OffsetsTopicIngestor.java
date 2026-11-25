@@ -10,12 +10,13 @@ import io.karasu.core.snapshot.ClusterMetricsSnapshot.DecodeErrorKey;
 import io.karasu.core.storage.ClusterStore;
 import io.karasu.protocol.decode.DecodedRecord;
 import io.karasu.protocol.decode.DecodedRecord.ClassicGroupMetadataRecord;
+import io.karasu.protocol.decode.DecodedRecord.ClassicGroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.DecodeFailureRecord;
-import io.karasu.protocol.decode.DecodedRecord.GroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.IgnoredInternalRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848AssignmentTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848CurrentAssignmentRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848GroupMetadataRecord;
+import io.karasu.protocol.decode.DecodedRecord.Kip848GroupTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848MemberMetadataRecord;
 import io.karasu.protocol.decode.DecodedRecord.Kip848MemberTombstoneRecord;
 import io.karasu.protocol.decode.DecodedRecord.MemberAssignment;
@@ -54,10 +55,12 @@ import java.util.function.Consumer;
  *
  * <p>Key design guarantees:
  * <ul>
- *   <li>Strictly single-threaded ownership of each {@link KafkaConsumer} instance; external stop uses {@code wakeup()}.</li>
- *   <li>Cancellable exponential backoff waiting when {@code __consumer_offsets} does not yet exist.</li>
- *   <li>Sequential {@code EARLIEST_THEN_LIVE} catch-up gate preventing replay-induced false lag/alerts.</li>
- *   <li>Default {@code read_committed} isolation filtering aborted/uncommitted EOS transactional commits.</li>
+ *   <li>Strictly single-threaded ownership of each {@link KafkaConsumer}; external stop uses {@code wakeup()}.</li>
+ *   <li>Per-worker independent health, catch-up, poll-freshness, and error state; reconnecting a worker
+ *       always resets its catch-up flag before replaying (#04).</li>
+ *   <li>Runtime internal-backlog stall detector degrades {@code offsetsCaughtUp} when any partition lags behind
+ *       a watermark beyond {@link #MAX_RUNTIME_BACKLOG_STALL_MS} (#04).</li>
+ *   <li>Classic/KIP-848 group metadata tombstones clear member metadata without erasing committed offsets (#02).</li>
  * </ul>
  */
 public final class OffsetsTopicIngestor {
@@ -66,6 +69,7 @@ public final class OffsetsTopicIngestor {
     private static final Duration POLL_TIMEOUT = Duration.ofMillis(500);
     private static final long INITIAL_BACKOFF_MS = 2_000L;
     private static final long MAX_BACKOFF_MS = 30_000L;
+    private static final long MAX_RUNTIME_BACKLOG_STALL_MS = 60_000L;
 
     private final ClusterSpec spec;
     private final long generation;
@@ -75,17 +79,14 @@ public final class OffsetsTopicIngestor {
     private final Consumer<String> onGroupChanged;
 
     private final AtomicBoolean stopping = new AtomicBoolean(false);
-    private final AtomicBoolean waitingForTopic = new AtomicBoolean(false);
-    private final AtomicBoolean caughtUp = new AtomicBoolean(false);
-    private final AtomicBoolean healthy = new AtomicBoolean(true);
-    private final AtomicReference<String> lastError = new AtomicReference<>("");
     private final ConcurrentHashMap<Integer, Long> partitionPositions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, BacklogWatermark> partitionWatermarks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<DecodeErrorKey, AtomicLong> decodeErrors = new ConcurrentHashMap<>();
     private final Set<Short> loggedUnknownTypes = ConcurrentHashMap.newKeySet();
 
     private final List<Thread> workerThreads = new ArrayList<>();
     private final List<AtomicReference<KafkaConsumer<byte[], byte[]>>> consumerRefs = new ArrayList<>();
-    private final AtomicBoolean[] workerCaughtUp;
+    private final WorkerState[] workerStates;
 
     public OffsetsTopicIngestor(ClusterSpec spec,
                                 long generation,
@@ -99,9 +100,9 @@ public final class OffsetsTopicIngestor {
         this.decoder = new OffsetsRecordDecoder();
         this.onGroupChanged = onGroupChanged;
         int workers = spec.collection().offsetsConsumerThreads();
-        this.workerCaughtUp = new AtomicBoolean[workers];
+        this.workerStates = new WorkerState[workers];
         for (int i = 0; i < workers; i++) {
-            this.workerCaughtUp[i] = new AtomicBoolean(false);
+            this.workerStates[i] = new WorkerState();
             this.consumerRefs.add(new AtomicReference<>());
         }
     }
@@ -152,25 +153,63 @@ public final class OffsetsTopicIngestor {
     }
 
     public boolean isWaitingForTopic() {
-        return waitingForTopic.get();
-    }
-
-    public boolean isCaughtUp() {
-        return caughtUp.get();
-    }
-
-    public boolean isHealthy() {
-        return healthy.get();
-    }
-
-    public String lastError() {
-        return lastError.get();
+        for (WorkerState ws : workerStates) {
+            if (ws.waitingForTopic.get()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
-     * Computes remaining unread records in {@code __consumer_offsets} by comparing broker head offsets
-     * with each assigned partition's last consumed position.
+     * Returns true iff EVERY worker has completed initial/reconnect replay catch-up AND
+     * no assigned {@code __consumer_offsets} partition has remained stalled behind a watermark
+     * longer than {@link #MAX_RUNTIME_BACKLOG_STALL_MS}.
      */
+    public boolean isCaughtUp() {
+        return isCaughtUp(System.currentTimeMillis());
+    }
+
+    boolean isCaughtUp(long nowMs) {
+        for (WorkerState ws : workerStates) {
+            if (!ws.caughtUp.get()) {
+                return false;
+            }
+        }
+        return !hasRuntimeBacklogStall(nowMs);
+    }
+
+    /**
+     * Returns true iff EVERY worker is currently healthy and has polled within freshness bounds.
+     */
+    public boolean isHealthy() {
+        return isHealthy(System.currentTimeMillis());
+    }
+
+    boolean isHealthy(long nowMs) {
+        long maxPollSilenceMs = Math.max(spec.collection().requestTimeoutMs() * 3L, 30_000L);
+        for (WorkerState ws : workerStates) {
+            if (!ws.healthy.get()) {
+                return false;
+            }
+            long lastPoll = ws.lastPollSuccessMs.get();
+            if (lastPoll > 0L && (nowMs - lastPoll) > maxPollSilenceMs) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public String lastError() {
+        for (WorkerState ws : workerStates) {
+            String err = ws.lastError.get();
+            if (err != null && !err.isEmpty()) {
+                return err;
+            }
+        }
+        return "";
+    }
+
     public long computeInternalOffsetsLag() {
         String topic = spec.collection().offsetsTopic();
         long totalLag = 0L;
@@ -191,16 +230,53 @@ public final class OffsetsTopicIngestor {
         return out;
     }
 
+    // Package-private test hooks for worker state and runtime backlog verification (#04)
+    void markWorkerStateForTest(int workerIdx, boolean caughtUp, boolean healthy, long lastPollMs, String error) {
+        WorkerState ws = workerStates[workerIdx];
+        ws.caughtUp.set(caughtUp);
+        ws.healthy.set(healthy);
+        ws.lastPollSuccessMs.set(lastPollMs);
+        ws.lastError.set(error == null ? "" : error);
+    }
+
+    void updatePartitionPositionForTest(int partition, long position) {
+        partitionPositions.put(partition, position);
+    }
+
+    private boolean hasRuntimeBacklogStall(long nowMs) {
+        String topic = spec.collection().offsetsTopic();
+        boolean stalled = false;
+        for (Map.Entry<Integer, Long> entry : partitionPositions.entrySet()) {
+            int part = entry.getKey();
+            long pos = entry.getValue();
+            long head = store.getLatestBrokerOffset(topic, part);
+            if (head <= pos) {
+                partitionWatermarks.remove(part);
+                continue;
+            }
+            BacklogWatermark wm = partitionWatermarks.get(part);
+            if (wm == null || pos >= wm.targetHead) {
+                // Caught up to previous watermark; record new watermark at current head
+                partitionWatermarks.put(part, new BacklogWatermark(head, nowMs));
+            } else if ((nowMs - wm.observedAtMs) > MAX_RUNTIME_BACKLOG_STALL_MS) {
+                stalled = true;
+            }
+        }
+        return stalled;
+    }
+
     private void runWorker(int workerIdx, int totalWorkers) {
+        WorkerState ws = workerStates[workerIdx];
         try (MDC.MDCCloseable c1 = MDC.putCloseable("k8s_cluster", spec.targetKey().k8sCluster());
              MDC.MDCCloseable c2 = MDC.putCloseable("kafka_cluster", spec.targetKey().kafkaCluster());
              MDC.MDCCloseable c3 = MDC.putCloseable("gen", Long.toString(generation))) {
 
             long backoffMs = INITIAL_BACKOFF_MS;
             while (!stopping.get()) {
+                // Always reset caughtUp when establishing or re-establishing a consumer session (#04)
+                ws.caughtUp.set(false);
                 KafkaConsumer<byte[], byte[]> consumer = null;
                 try {
-                    // Wait briefly for initial broker head metadata so replay commits can compute commit-time lag
                     waitForInitialBrokerMetadata();
                     if (stopping.get()) {
                         return;
@@ -214,9 +290,9 @@ public final class OffsetsTopicIngestor {
                     Duration apiTimeout = Duration.ofMillis(spec.collection().requestTimeoutMs());
                     List<PartitionInfo> infos = consumer.partitionsFor(offsetsTopic, apiTimeout);
                     if (infos == null || infos.isEmpty()) {
-                        waitingForTopic.set(true);
-                        healthy.set(false);
-                        lastError.set("offsets_topic_unavailable: " + offsetsTopic);
+                        ws.waitingForTopic.set(true);
+                        ws.healthy.set(false);
+                        ws.lastError.set("offsets_topic_unavailable: " + offsetsTopic);
                         log.warn("Internal topic '{}' not yet available; retrying in {}ms", offsetsTopic, backoffMs);
                         closeQuietly(consumer, workerIdx);
                         consumer = null;
@@ -225,14 +301,14 @@ public final class OffsetsTopicIngestor {
                         continue;
                     }
 
-                    waitingForTopic.set(false);
+                    ws.waitingForTopic.set(false);
                     backoffMs = INITIAL_BACKOFF_MS;
 
                     List<TopicPartition> myPartitions = slicePartitions(infos, offsetsTopic, workerIdx, totalWorkers);
                     if (myPartitions.isEmpty()) {
-                        workerCaughtUp[workerIdx].set(true);
-                        recomputeGlobalCaughtUp();
-                        healthy.set(true);
+                        ws.caughtUp.set(true);
+                        ws.healthy.set(true);
+                        ws.lastPollSuccessMs.set(System.currentTimeMillis());
                         sleepCancellable(5_000L);
                         continue;
                     }
@@ -245,8 +321,7 @@ public final class OffsetsTopicIngestor {
                         for (TopicPartition tp : myPartitions) {
                             partitionPositions.put(tp.partition(), ends.getOrDefault(tp, 0L));
                         }
-                        workerCaughtUp[workerIdx].set(true);
-                        recomputeGlobalCaughtUp();
+                        ws.caughtUp.set(true);
                     } else {
                         Map<TopicPartition, Long> begins = consumer.beginningOffsets(myPartitions, apiTimeout);
                         Map<TopicPartition, Long> ends = consumer.endOffsets(myPartitions, apiTimeout);
@@ -255,22 +330,22 @@ public final class OffsetsTopicIngestor {
                             long begin = begins.getOrDefault(tp, 0L);
                             long end = ends.getOrDefault(tp, 0L);
                             partitionPositions.put(tp.partition(), begin);
+                            partitionWatermarks.remove(tp.partition());
                             if (end > begin) {
                                 replayTargets.put(tp, end);
                             }
                         }
                         if (replayTargets.isEmpty()) {
-                            workerCaughtUp[workerIdx].set(true);
-                            recomputeGlobalCaughtUp();
+                            ws.caughtUp.set(true);
                         }
                     }
 
-                    healthy.set(true);
-                    lastError.set("");
+                    ws.healthy.set(true);
+                    ws.lastError.set("");
+                    ws.lastPollSuccessMs.set(System.currentTimeMillis());
                     log.info("Started __consumer_offsets worker {} on {} partitions (replayPending={})",
                             workerIdx, myPartitions.size(), replayTargets.size());
 
-                    // Main poll loop
                     while (!stopping.get()) {
                         ConsumerRecords<byte[], byte[]> records = consumer.poll(POLL_TIMEOUT);
                         long nowMs = System.currentTimeMillis();
@@ -279,17 +354,17 @@ public final class OffsetsTopicIngestor {
                             partitionPositions.put(rec.partition(), rec.offset() + 1L);
                         }
                         if (!replayTargets.isEmpty()) {
-                            checkReplayProgress(consumer, replayTargets, workerIdx);
-                        } else if (!workerCaughtUp[workerIdx].get()) {
-                            workerCaughtUp[workerIdx].set(true);
-                            recomputeGlobalCaughtUp();
+                            checkReplayProgress(consumer, replayTargets, ws, workerIdx);
+                        } else if (!ws.caughtUp.get()) {
+                            ws.caughtUp.set(true);
                         }
-                        // Update positions even on idle polls (handles trailing transaction markers)
                         for (TopicPartition tp : myPartitions) {
                             long pos = consumer.position(tp, Duration.ofSeconds(1));
                             partitionPositions.put(tp.partition(), pos);
                         }
-                        healthy.set(true);
+                        ws.healthy.set(true);
+                        ws.lastError.set("");
+                        ws.lastPollSuccessMs.set(nowMs);
                     }
                 } catch (WakeupException we) {
                     if (stopping.get()) {
@@ -297,25 +372,28 @@ public final class OffsetsTopicIngestor {
                         return;
                     }
                 } catch (UnknownTopicOrPartitionException utpe) {
-                    waitingForTopic.set(true);
-                    healthy.set(false);
-                    lastError.set("offsets_topic_missing: " + safeMsg(utpe));
+                    ws.caughtUp.set(false);
+                    ws.waitingForTopic.set(true);
+                    ws.healthy.set(false);
+                    ws.lastError.set("offsets_topic_missing: " + safeMsg(utpe));
                     log.warn("Internal offsets topic missing; backing off {}ms", backoffMs);
                     sleepCancellable(backoffMs);
                     backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
                 } catch (AuthenticationException | AuthorizationException authEx) {
-                    healthy.set(false);
-                    lastError.set("auth_or_acl_error: " + authEx.getClass().getSimpleName() + ": " + safeMsg(authEx));
-                    log.error("Offsets consumer authentication/ACL denied: {}", lastError.get());
+                    ws.caughtUp.set(false);
+                    ws.healthy.set(false);
+                    ws.lastError.set("auth_or_acl_error: " + authEx.getClass().getSimpleName() + ": " + safeMsg(authEx));
+                    log.error("Offsets consumer authentication/ACL denied: {}", ws.lastError.get());
                     sleepCancellable(backoffMs);
                     backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
                 } catch (Exception e) {
                     if (stopping.get()) {
                         return;
                     }
-                    healthy.set(false);
-                    lastError.set("consume_error: " + e.getClass().getSimpleName() + ": " + safeMsg(e));
-                    log.warn("Offsets consumer worker {} error ({}); retrying in {}ms", workerIdx, lastError.get(), backoffMs);
+                    ws.caughtUp.set(false);
+                    ws.healthy.set(false);
+                    ws.lastError.set("consume_error: " + e.getClass().getSimpleName() + ": " + safeMsg(e));
+                    log.warn("Offsets consumer worker {} error ({}); retrying in {}ms", workerIdx, ws.lastError.get(), backoffMs);
                     sleepCancellable(backoffMs);
                     backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
                 } finally {
@@ -327,6 +405,7 @@ public final class OffsetsTopicIngestor {
 
     private void checkReplayProgress(KafkaConsumer<byte[], byte[]> consumer,
                                      Map<TopicPartition, Long> replayTargets,
+                                     WorkerState ws,
                                      int workerIdx) {
         List<TopicPartition> done = new ArrayList<>();
         for (Map.Entry<TopicPartition, Long> entry : replayTargets.entrySet()) {
@@ -340,20 +419,9 @@ public final class OffsetsTopicIngestor {
             replayTargets.remove(tp);
         }
         if (replayTargets.isEmpty()) {
-            workerCaughtUp[workerIdx].set(true);
-            recomputeGlobalCaughtUp();
-            log.info("Offsets worker {} completed initial replay catch-up", workerIdx);
+            ws.caughtUp.set(true);
+            log.info("Offsets worker {} completed replay catch-up", workerIdx);
         }
-    }
-
-    private void recomputeGlobalCaughtUp() {
-        for (AtomicBoolean flag : workerCaughtUp) {
-            if (!flag.get()) {
-                caughtUp.set(false);
-                return;
-            }
-        }
-        caughtUp.set(true);
     }
 
     void handleRecord(ConsumerRecord<byte[], byte[]> rec, long observedMs) {
@@ -366,7 +434,8 @@ public final class OffsetsTopicIngestor {
                     commit.offset(),
                     rec.offset(),
                     commit.commitTimestampMs(),
-                    observedMs
+                    observedMs,
+                    commit.topicId()
             );
         } else if (decoded instanceof OffsetTombstoneRecord tombstone) {
             store.deleteConsumerPartition(tombstone.group(), tombstone.topic(), tombstone.partition());
@@ -385,9 +454,13 @@ public final class OffsetsTopicIngestor {
                     }
                 }
             }
-        } else if (decoded instanceof GroupTombstoneRecord groupTombstone) {
-            store.deleteConsumerGroup(groupTombstone.group());
-            notifyGroupChanged(groupTombstone.group());
+        } else if (decoded instanceof ClassicGroupTombstoneRecord classicTombstone) {
+            // Preserve committed offsets across Classic -> KIP-848 online protocol migration (#02)
+            store.clearClassicGroupMetadata(classicTombstone.group());
+            notifyGroupChanged(classicTombstone.group());
+        } else if (decoded instanceof Kip848GroupTombstoneRecord kip848Tombstone) {
+            store.clearKip848GroupMetadata(kip848Tombstone.group());
+            notifyGroupChanged(kip848Tombstone.group());
         } else if (decoded instanceof Kip848GroupMetadataRecord) {
             // Group tracked via member/offset records
         } else if (decoded instanceof Kip848MemberMetadataRecord member) {
@@ -461,5 +534,16 @@ public final class OffsetsTopicIngestor {
 
     private static String safeMsg(Throwable t) {
         return t.getMessage() == null ? "" : t.getMessage();
+    }
+
+    private static final class WorkerState {
+        final AtomicBoolean caughtUp = new AtomicBoolean(false);
+        final AtomicBoolean healthy = new AtomicBoolean(false);
+        final AtomicBoolean waitingForTopic = new AtomicBoolean(false);
+        final AtomicLong lastPollSuccessMs = new AtomicLong(0L);
+        final AtomicReference<String> lastError = new AtomicReference<>("");
+    }
+
+    private record BacklogWatermark(long targetHead, long observedAtMs) {
     }
 }

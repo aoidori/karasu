@@ -43,6 +43,10 @@ public class KarasuProperties {
     public void setClusters(List<ClusterItem> clusters) { this.clusters = clusters; }
 
     public ClusterSpec toClusterSpec(ClusterItem item) {
+        return toClusterSpec(item, null);
+    }
+
+    public ClusterSpec toClusterSpec(ClusterItem item, KarasuProperties fallbackProps) {
         ClusterTargetKey key = new ClusterTargetKey(item.getK8sCluster(), item.getKafkaCluster());
 
         AuthItem a = item.getAuth();
@@ -56,32 +60,59 @@ public class KarasuProperties {
                 ? TlsSpec.DISABLED
                 : new TlsSpec(t.isEnabled(), t.getCaFile(), t.getCertFile(), t.getKeyFile(), t.getEndpointIdentificationAlgorithm());
 
-        CollectionItem dc = defaults.getCollection();
+        CollectionItem bc = CollectionItem.defaultValues();
+        CollectionItem fc = fallbackProps != null && fallbackProps.getDefaults() != null
+                ? fallbackProps.getDefaults().getCollection() : null;
+        CollectionItem dc = defaults != null ? defaults.getCollection() : null;
         CollectionItem c = item.getCollection();
+        Integer fallbackSnapSec = fallbackProps != null && fallbackProps.getMetrics() != null
+                ? fallbackProps.getMetrics().getSnapshotRefreshSeconds() : null;
+        Integer metricsSnapSec = metrics != null ? metrics.getSnapshotRefreshSeconds() : null;
         CollectionSpec collection = new CollectionSpec(
-                pick(c != null ? c.getOffsetsTopic() : null, dc.getOffsetsTopic()),
-                pick(c != null ? c.getOffsetRefreshSeconds() : null, dc.getOffsetRefreshSeconds()),
-                pick(c != null ? c.getTopicRefreshSeconds() : null, dc.getTopicRefreshSeconds()),
-                pick(c != null ? c.getSnapshotRefreshSeconds() : null, metrics.getSnapshotRefreshSeconds()),
-                pick(c != null ? c.getStartMode() : null, dc.getStartMode()),
-                pick(c != null ? c.getIsolationLevel() : null, dc.getIsolationLevel()),
-                pick(c != null ? c.getOffsetsConsumerThreads() : null, dc.getOffsetsConsumerThreads()),
-                pick(c != null ? c.getGroupsReaperSeconds() : null, dc.getGroupsReaperSeconds()),
-                pick(c != null ? c.getSwapPolicy() : null, dc.getSwapPolicy()),
-                pick(c != null ? c.getRequestTimeoutMs() : null, dc.getRequestTimeoutMs()),
-                pick(c != null ? c.getFetchMaxBytes() : null, dc.getFetchMaxBytes()),
-                pick(c != null ? c.getMaxPollRecords() : null, dc.getMaxPollRecords())
+                pick(c != null ? c.getOffsetsTopic() : null, dc != null ? dc.getOffsetsTopic() : null,
+                        fc != null ? fc.getOffsetsTopic() : null, bc.getOffsetsTopic()),
+                pick(c != null ? c.getOffsetRefreshSeconds() : null, dc != null ? dc.getOffsetRefreshSeconds() : null,
+                        fc != null ? fc.getOffsetRefreshSeconds() : null, bc.getOffsetRefreshSeconds()),
+                pick(c != null ? c.getTopicRefreshSeconds() : null, dc != null ? dc.getTopicRefreshSeconds() : null,
+                        fc != null ? fc.getTopicRefreshSeconds() : null, bc.getTopicRefreshSeconds()),
+                pick(c != null ? c.getSnapshotRefreshSeconds() : null, dc != null ? dc.getSnapshotRefreshSeconds() : null,
+                        metricsSnapSec != null ? metricsSnapSec : fallbackSnapSec, bc.getSnapshotRefreshSeconds()),
+                pick(c != null ? c.getStartMode() : null, dc != null ? dc.getStartMode() : null,
+                        fc != null ? fc.getStartMode() : null, bc.getStartMode()),
+                pick(c != null ? c.getIsolationLevel() : null, dc != null ? dc.getIsolationLevel() : null,
+                        fc != null ? fc.getIsolationLevel() : null, bc.getIsolationLevel()),
+                pick(c != null ? c.getOffsetsConsumerThreads() : null, dc != null ? dc.getOffsetsConsumerThreads() : null,
+                        fc != null ? fc.getOffsetsConsumerThreads() : null, bc.getOffsetsConsumerThreads()),
+                pick(c != null ? c.getGroupsReaperSeconds() : null, dc != null ? dc.getGroupsReaperSeconds() : null,
+                        fc != null ? fc.getGroupsReaperSeconds() : null, bc.getGroupsReaperSeconds()),
+                pick(c != null ? c.getSwapPolicy() : null, dc != null ? dc.getSwapPolicy() : null,
+                        fc != null ? fc.getSwapPolicy() : null, bc.getSwapPolicy()),
+                pick(c != null ? c.getRequestTimeoutMs() : null, dc != null ? dc.getRequestTimeoutMs() : null,
+                        fc != null ? fc.getRequestTimeoutMs() : null, bc.getRequestTimeoutMs()),
+                pick(c != null ? c.getFetchMaxBytes() : null, dc != null ? dc.getFetchMaxBytes() : null,
+                        fc != null ? fc.getFetchMaxBytes() : null, bc.getFetchMaxBytes()),
+                pick(c != null ? c.getMaxPollRecords() : null, dc != null ? dc.getMaxPollRecords() : null,
+                        fc != null ? fc.getMaxPollRecords() : null, bc.getMaxPollRecords())
         );
 
-        EvaluationItem de = defaults.getEvaluation();
+        EvaluationItem be = EvaluationItem.defaultValues();
+        EvaluationItem fe = fallbackProps != null && fallbackProps.getDefaults() != null
+                ? fallbackProps.getDefaults().getEvaluation() : null;
+        EvaluationItem de = defaults != null ? defaults.getEvaluation() : null;
         EvaluationItem e = item.getEvaluation();
         EvaluationSpec evaluation = new EvaluationSpec(
-                pick(e != null ? e.getIntervals() : null, de.getIntervals()),
-                pick(e != null ? e.getMinDistanceSeconds() : null, de.getMinDistanceSeconds()),
-                pick(e != null ? e.getExpireGroupSeconds() : null, de.getExpireGroupSeconds()),
-                pick(e != null ? e.getAllowedLag() : null, de.getAllowedLag()),
-                pick(e != null ? e.getMinimumComplete() : null, de.getMinimumComplete()),
-                pick(e != null ? e.getCacheExpireSeconds() : null, de.getCacheExpireSeconds())
+                pick(e != null ? e.getIntervals() : null, de != null ? de.getIntervals() : null,
+                        fe != null ? fe.getIntervals() : null, be.getIntervals()),
+                pick(e != null ? e.getMinDistanceSeconds() : null, de != null ? de.getMinDistanceSeconds() : null,
+                        fe != null ? fe.getMinDistanceSeconds() : null, be.getMinDistanceSeconds()),
+                pick(e != null ? e.getExpireGroupSeconds() : null, de != null ? de.getExpireGroupSeconds() : null,
+                        fe != null ? fe.getExpireGroupSeconds() : null, be.getExpireGroupSeconds()),
+                pick(e != null ? e.getAllowedLag() : null, de != null ? de.getAllowedLag() : null,
+                        fe != null ? fe.getAllowedLag() : null, be.getAllowedLag()),
+                pick(e != null ? e.getMinimumComplete() : null, de != null ? de.getMinimumComplete() : null,
+                        fe != null ? fe.getMinimumComplete() : null, be.getMinimumComplete()),
+                pick(e != null ? e.getCacheExpireSeconds() : null, de != null ? de.getCacheExpireSeconds() : null,
+                        fe != null ? fe.getCacheExpireSeconds() : null, be.getCacheExpireSeconds())
         );
 
         FilterItem f = item.getFilters();
@@ -91,11 +122,16 @@ public class KarasuProperties {
                 f.getTopicAllowlist(), f.getTopicDenylist(),
                 f.getExportTopicPartitionOffset() == null || f.getExportTopicPartitionOffset());
 
-        LimitsItem dl = defaults.getLimits();
+        LimitsItem bl = LimitsItem.defaultValues();
+        LimitsItem fl = fallbackProps != null && fallbackProps.getDefaults() != null
+                ? fallbackProps.getDefaults().getLimits() : null;
+        LimitsItem dl = defaults != null ? defaults.getLimits() : null;
         LimitsItem l = item.getLimits();
         LimitsSpec limits = new LimitsSpec(
-                pick(l != null ? l.getMaxGroups() : null, dl.getMaxGroups()),
-                pick(l != null ? l.getMaxGroupPartitions() : null, dl.getMaxGroupPartitions())
+                pick(l != null ? l.getMaxGroups() : null, dl != null ? dl.getMaxGroups() : null,
+                        fl != null ? fl.getMaxGroups() : null, bl.getMaxGroups()),
+                pick(l != null ? l.getMaxGroupPartitions() : null, dl != null ? dl.getMaxGroupPartitions() : null,
+                        fl != null ? fl.getMaxGroupPartitions() : null, bl.getMaxGroupPartitions())
         );
 
         return new ClusterSpec(
@@ -112,19 +148,28 @@ public class KarasuProperties {
         );
     }
 
-    private static <T> T pick(T override, T fallback) {
-        return override != null ? override : fallback;
+    @SafeVarargs
+    private static <T> T pick(T... candidates) {
+        for (T candidate : candidates) {
+            if (candidate != null) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     public static class Config {
         private boolean watchEnabled = true;
         private int watchIntervalSeconds = 15;
+        private List<String> watchFiles = new ArrayList<>();
         private List<String> additionalClusterDirs = new ArrayList<>();
 
         public boolean isWatchEnabled() { return watchEnabled; }
         public void setWatchEnabled(boolean watchEnabled) { this.watchEnabled = watchEnabled; }
         public int getWatchIntervalSeconds() { return watchIntervalSeconds; }
         public void setWatchIntervalSeconds(int watchIntervalSeconds) { this.watchIntervalSeconds = watchIntervalSeconds; }
+        public List<String> getWatchFiles() { return watchFiles; }
+        public void setWatchFiles(List<String> watchFiles) { this.watchFiles = watchFiles; }
         public List<String> getAdditionalClusterDirs() { return additionalClusterDirs; }
         public void setAdditionalClusterDirs(List<String> additionalClusterDirs) { this.additionalClusterDirs = additionalClusterDirs; }
     }

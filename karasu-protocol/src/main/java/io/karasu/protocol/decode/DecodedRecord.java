@@ -49,7 +49,20 @@ public sealed interface DecodedRecord {
     ) implements DecodedRecord {
     }
 
-    record GroupTombstoneRecord(
+    /**
+     * Key-2 tombstone: classic group metadata deleted (including during Classic -> KIP-848 online upgrade).
+     * Does NOT imply committed partition offsets (Key 0/1) were deleted.
+     */
+    record ClassicGroupTombstoneRecord(
+            String group
+    ) implements DecodedRecord {
+    }
+
+    /**
+     * Key-3 tombstone: KIP-848 consumer group metadata deleted.
+     * Does NOT imply committed partition offsets (Key 0/1) were deleted.
+     */
+    record Kip848GroupTombstoneRecord(
             String group
     ) implements DecodedRecord {
     }

@@ -21,23 +21,19 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.event.EventListener;
+import org.springframework.core.env.Environment;
 
 import java.util.List;
 
 /**
- * Spring Boot wiring for Karasu core engine, multi-cluster providers, extensible label enrichers,
- * and native Prometheus {@code MultiCollector} registration.
+ * Spring Boot wiring for Karasu core engine, multi-provider union reconciliation,
+ * merged-label pre-validation, and native Prometheus {@code MultiCollector} registration.
  */
 @Configuration
 @EnableConfigurationProperties(KarasuProperties.class)
 public class KarasuAutoConfiguration {
 
     private static final Logger log = LoggerFactory.getLogger(KarasuAutoConfiguration.class);
-
-    @Bean(destroyMethod = "close")
-    public ClusterManager clusterManager(KarasuProperties properties) {
-        return new ClusterManager(properties.getMetrics().getMaxExtraLabelsPerCluster());
-    }
 
     @Bean
     public LabelNormalizer labelNormalizer(KarasuProperties properties,
@@ -49,6 +45,14 @@ public class KarasuAutoConfiguration {
                 properties.getMetrics().getMaxExtraLabelsPerCluster(),
                 enrichers
         );
+    }
+
+    @Bean(destroyMethod = "close")
+    public ClusterManager clusterManager(KarasuProperties properties, LabelNormalizer labelNormalizer) {
+        ClusterManager manager = new ClusterManager(properties.getMetrics().getMaxExtraLabelsPerCluster());
+        // Pre-validate merged L1+L2+L3 labels before activating any cluster target (#12)
+        manager.setExtraSpecValidator(labelNormalizer::validateMergedClusterSpec);
+        return manager;
     }
 
     @Bean
@@ -75,8 +79,9 @@ public class KarasuAutoConfiguration {
     }
 
     @Bean(destroyMethod = "close")
-    public ApplicationPropertiesClusterProvider applicationPropertiesClusterProvider(KarasuProperties properties) {
-        return new ApplicationPropertiesClusterProvider(properties);
+    public ApplicationPropertiesClusterProvider applicationPropertiesClusterProvider(KarasuProperties properties,
+                                                                                     Environment environment) {
+        return new ApplicationPropertiesClusterProvider(properties, environment);
     }
 
     @Bean
@@ -101,12 +106,16 @@ public class KarasuAutoConfiguration {
 
         @EventListener(ApplicationReadyEvent.class)
         public void onApplicationReady() {
-            for (ClusterTargetProvider provider : providers) {
-                provider.onTargetsChanged(clusterManager::reconcile);
-                clusterManager.reconcile(provider.loadTargets());
+            // Register each provider under its own providerId so multiple sources merge cleanly (#13)
+            for (int i = 0; i < providers.size(); i++) {
+                ClusterTargetProvider provider = providers.get(i);
+                String providerId = provider.getClass().getName() + "#" + i;
+                provider.onTargetsChanged(specs -> clusterManager.reconcileFromProvider(providerId, specs));
+                clusterManager.reconcileFromProvider(providerId, provider.loadTargets());
             }
             defaultProvider.startWatchingIfEnabled();
-            log.info("Karasu initialized with {} active Kafka cluster target(s)", clusterManager.activeTargets().size());
+            log.info("Karasu initialized with {} active Kafka cluster target(s) from {} provider(s)",
+                    clusterManager.activeTargets().size(), providers.size());
         }
     }
 }
